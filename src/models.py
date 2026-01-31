@@ -120,6 +120,9 @@ class RuntimeModel:
     Innovation: Instead of predicting total time directly, we model:
         total_time = setup_time + per_shot_time * 10000
 
+    The model now takes predicted_threshold as an additional input feature,
+    since higher threshold = more computation = longer runtime.
+
     Setup time is dominated by backend (GPU has 23x overhead).
     Per-shot time is dominated by qubit count, threshold, and circuit depth.
 
@@ -168,20 +171,33 @@ class RuntimeModel:
         self._fitted = False
         self._has_decomposed = False
 
+    def _add_threshold_feature(self, X: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+        """Add log2(threshold) as an additional feature column."""
+        # Use log2 of threshold as feature (1->0, 2->1, 4->2, ..., 256->8)
+        thr_feature = np.log2(np.clip(thresholds, 1, 512)).reshape(-1, 1)
+        return np.hstack([X, thr_feature])
+
     def fit(
         self,
         X: np.ndarray,
         y_total_time: np.ndarray,
+        thresholds: np.ndarray,
         y_setup_time: Optional[np.ndarray] = None,
         y_per_shot_time: Optional[np.ndarray] = None,
     ):
         """
         Fit the runtime model.
 
-        If setup and per_shot times are provided, uses decomposed modeling.
-        Otherwise falls back to direct total time prediction.
+        Args:
+            X: Feature matrix (n_samples, n_features)
+            y_total_time: Total forward run time
+            thresholds: Threshold values (used as input feature)
+            y_setup_time: Optional setup time for decomposed modeling
+            y_per_shot_time: Optional per-shot time for decomposed modeling
         """
-        X_scaled = self.scaler.fit_transform(X)
+        # Add threshold as input feature
+        X_with_thr = self._add_threshold_feature(X, thresholds)
+        X_scaled = self.scaler.fit_transform(X_with_thr)
 
         # Always fit total model as fallback
         y_log_total = np.log1p(y_total_time)
@@ -202,9 +218,22 @@ class RuntimeModel:
 
         self._fitted = True
 
-    def predict(self, X: np.ndarray, use_decomposed: bool = True) -> np.ndarray:
-        """Predict total forward run time."""
-        X_scaled = self.scaler.transform(X)
+    def predict(
+        self,
+        X: np.ndarray,
+        thresholds: np.ndarray,
+        use_decomposed: bool = True,
+    ) -> np.ndarray:
+        """
+        Predict total forward run time.
+
+        Args:
+            X: Feature matrix
+            thresholds: Predicted threshold values (used as input feature)
+            use_decomposed: Whether to use decomposed prediction
+        """
+        X_with_thr = self._add_threshold_feature(X, thresholds)
+        X_scaled = self.scaler.transform(X_with_thr)
 
         if use_decomposed and self._has_decomposed:
             log_setup = self.setup_model.predict(X_scaled)
@@ -221,13 +250,18 @@ class RuntimeModel:
             log_total = self.total_model.predict(X_scaled)
             return np.expm1(log_total)
 
-    def predict_decomposed(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict_decomposed(
+        self,
+        X: np.ndarray,
+        thresholds: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict setup time, per-shot time, and total time.
 
         Returns: (setup_time, per_shot_time, total_time)
         """
-        X_scaled = self.scaler.transform(X)
+        X_with_thr = self._add_threshold_feature(X, thresholds)
+        X_scaled = self.scaler.transform(X_with_thr)
 
         if self._has_decomposed:
             log_setup = self.setup_model.predict(X_scaled)
@@ -236,7 +270,7 @@ class RuntimeModel:
             per_shot = np.expm1(log_per_shot)
             total = setup + per_shot * 10000
         else:
-            total = self.predict(X, use_decomposed=False)
+            total = self.predict(X, thresholds, use_decomposed=False)
             # Rough decomposition for non-decomposed model
             setup = total * 0.05  # Assume 5% is setup
             per_shot = (total - setup) / 10000
@@ -249,6 +283,7 @@ class CombinedPredictor:
     End-to-end predictor combining threshold and runtime models.
 
     Provides a single interface for making predictions on new circuits.
+    Supports feature selection and sequential prediction (threshold -> runtime).
     """
 
     def __init__(
@@ -259,6 +294,8 @@ class CombinedPredictor:
         self.threshold_model = threshold_model or ThresholdModel()
         self.runtime_model = runtime_model or RuntimeModel()
         self.feature_columns: List[str] = []
+        self.selected_feature_names: List[str] = []
+        self.feature_selector = None  # Optional FeatureSelector
 
     def fit(
         self,
@@ -269,21 +306,40 @@ class CombinedPredictor:
         y_per_shot_time: Optional[np.ndarray] = None,
         feature_columns: Optional[List[str]] = None,
     ):
-        """Fit both models."""
+        """Fit both models (legacy method, prefer training separately)."""
         self.threshold_model.fit(X, y_threshold)
-        self.runtime_model.fit(X, y_total_time, y_setup_time, y_per_shot_time)
+        # For legacy fit, use true thresholds
+        self.runtime_model.fit(X, y_total_time, y_threshold, y_setup_time, y_per_shot_time)
 
         if feature_columns is not None:
             self.feature_columns = feature_columns
 
-    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, X: np.ndarray, families: Optional[List[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Predict threshold and runtime.
+        Predict threshold and runtime using sequential prediction.
+
+        Steps:
+        1. Apply feature selection (if selector is set)
+        2. Predict thresholds
+        3. Apply family floors (if families provided)
+        4. Predict runtime using predicted thresholds
 
         Returns: (predicted_thresholds, predicted_times)
         """
+        # Apply feature selection if available
+        if self.feature_selector is not None:
+            X = self.feature_selector.transform(X)
+
+        # Step 1: Predict thresholds
         thresholds = self.threshold_model.predict(X)
-        times = self.runtime_model.predict(X)
+
+        # Step 2: Apply family floors if families provided
+        if families is not None:
+            thresholds = apply_family_floor(thresholds, families)
+
+        # Step 3: Predict runtime using predicted thresholds (sequential prediction)
+        times = self.runtime_model.predict(X, thresholds)
+
         return thresholds, times
 
     def save(self, path: str | Path):
@@ -294,6 +350,8 @@ class CombinedPredictor:
                 "threshold_model": self.threshold_model,
                 "runtime_model": self.runtime_model,
                 "feature_columns": self.feature_columns,
+                "selected_feature_names": self.selected_feature_names,
+                "feature_selector": self.feature_selector,
             }, f)
 
     @classmethod
@@ -308,6 +366,8 @@ class CombinedPredictor:
             runtime_model=data["runtime_model"],
         )
         predictor.feature_columns = data.get("feature_columns", [])
+        predictor.selected_feature_names = data.get("selected_feature_names", [])
+        predictor.feature_selector = data.get("feature_selector", None)
         return predictor
 
 
