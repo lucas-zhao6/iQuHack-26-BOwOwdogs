@@ -56,6 +56,8 @@ sum_cut_pressure
 cut_pressure_entropy
 n_active_cuts
 cut_pressure_frac_active
+edge_cutwidth_natural
+entangling_cutwidth_natural
 max_gate_span
 mean_gate_span
 std_gate_span
