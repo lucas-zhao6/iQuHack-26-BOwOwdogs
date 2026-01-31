@@ -46,6 +46,7 @@ from src.scoring import (
     idx_to_threshold,
     find_optimal_safety_margin,
 )
+from src.feature_selection import FeatureSelector
 
 # Paths
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -109,16 +110,22 @@ def leave_one_circuit_out_cv(
     y_total_time: np.ndarray,
     y_setup_time: np.ndarray,
     y_per_shot_time: np.ndarray,
+    feature_names: list,
     threshold_params: dict,
     runtime_params: dict,
     safety_margin: float = 0.3,
     use_family_floor: bool = True,
+    n_features: int = 30,
 ) -> dict:
     """
     Perform leave-one-circuit-out cross-validation.
 
     This is critical because rows from the same circuit are correlated
     (same circuit, different backend/precision configs).
+
+    Key improvements:
+    1. Feature selection fitted on training data only (prevents leakage)
+    2. Sequential prediction: threshold first, then runtime uses predicted threshold
     """
     circuits = df["file"].unique()
     n_circuits = len(circuits)
@@ -141,26 +148,38 @@ def leave_one_circuit_out_cv(
         y_setup_train = y_setup_time[train_mask]
         y_per_shot_train = y_per_shot_time[train_mask]
 
-        # Get predicted family for test circuit (use true_family for CV, predicted_family for holdout)
+        # Get predicted family for test circuit
         test_families = df.loc[test_mask, "predicted_family"].tolist()
 
-        # Train models
+        # Step 1: Feature selection (fitted on training data only)
+        selector = FeatureSelector(k=n_features)
+        selector.fit(X_train, y_thr_train, y_time_train, feature_names)
+        X_train_sel = selector.transform(X_train)
+        X_test_sel = selector.transform(X_test)
+
+        # Step 2: Train threshold model on selected features
         thr_model = ThresholdModel(**threshold_params, safety_margin=safety_margin)
-        thr_model.fit(X_train, y_thr_train, calibrate=False)  # Use fixed margin
+        thr_model.fit(X_train_sel, y_thr_train, calibrate=False)
         thr_model.safety_margin = safety_margin
 
-        rt_model = RuntimeModel(**runtime_params)
-        rt_model.fit(X_train, y_time_train, y_setup_train, y_per_shot_train)
-
-        # Predict
-        pred_thresholds = thr_model.predict(X_test)
-        pred_times = rt_model.predict(X_test)
+        # Step 3: Predict thresholds (needed before runtime prediction)
+        pred_thresholds = thr_model.predict(X_test_sel)
 
         # Apply family floor (Innovation #3)
         if use_family_floor:
             pred_thresholds = apply_family_floor(pred_thresholds, test_families)
 
-        # Collect
+        # Step 4: Train runtime model with TRUE thresholds from training data
+        rt_model = RuntimeModel(**runtime_params)
+        rt_model.fit(
+            X_train_sel, y_time_train, y_thr_train,  # Use true thresholds for training
+            y_setup_train, y_per_shot_train
+        )
+
+        # Step 5: Predict runtime using PREDICTED thresholds (sequential prediction)
+        pred_times = rt_model.predict(X_test_sel, pred_thresholds)
+
+        # Collect results
         for j, (pt, tt, ptr, ttr, fam) in enumerate(zip(
             pred_thresholds, y_thr_test, pred_times, y_time_test, test_families
         )):
@@ -195,6 +214,8 @@ def tune_hyperparameters(
     y_total_time: np.ndarray,
     y_setup_time: np.ndarray,
     y_per_shot_time: np.ndarray,
+    feature_names: list,
+    n_features: int = 30,
 ) -> dict:
     """
     Grid search over hyperparameters using competition score.
@@ -202,6 +223,7 @@ def tune_hyperparameters(
     Returns best parameters for threshold and runtime models.
     """
     print("\n  Hyperparameter search (focused grid for speed):")
+    print(f"  Using feature selection: {n_features} features from {len(feature_names)}")
 
     # Focused grid - only tune most impactful params
     safety_margins = [0.0, 0.3, 0.5, 0.7, 1.0]
@@ -213,6 +235,7 @@ def tune_hyperparameters(
     best_score = -1
     best_margin = 0.3
     best_use_family = True
+    best_n_features = n_features
     total_evals = 0
 
     # First compare with vs without family floors
@@ -220,7 +243,8 @@ def tune_hyperparameters(
     for use_family in [False, True]:
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            base_thr_params, base_rt_params, safety_margin=0.0, use_family_floor=use_family
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=0.0, use_family_floor=use_family, n_features=n_features
         )
         score = result["scores"]["overall_score"]
         n_fail = result["scores"]["n_threshold_failures"]
@@ -233,7 +257,8 @@ def tune_hyperparameters(
     for margin in safety_margins:
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            base_thr_params, base_rt_params, safety_margin=margin, use_family_floor=True
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=margin, use_family_floor=True, n_features=n_features
         )
         score = result["scores"]["overall_score"]
         thr_score = result["scores"]["mean_threshold_score"]
@@ -246,9 +271,30 @@ def tune_hyperparameters(
             best_use_family = True
         total_evals += 1
 
+    # Optionally try different feature counts
+    print(f"\n  Tuning number of features (with best margin={best_margin}):")
+    for n_feat in [20, 25, 30, 40]:
+        if n_feat == n_features:
+            continue  # Already evaluated
+        result = leave_one_circuit_out_cv(
+            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=best_margin, use_family_floor=True, n_features=n_feat
+        )
+        score = result["scores"]["overall_score"]
+        thr_score = result["scores"]["mean_threshold_score"]
+        rt_score = result["scores"]["mean_runtime_score"]
+        n_fail = result["scores"]["n_threshold_failures"]
+        print(f"    n_features={n_feat}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
+        if score > best_score:
+            best_score = score
+            best_n_features = n_feat
+        total_evals += 1
+
     print(f"\n  Best configuration:")
     print(f"    Safety margin: {best_margin}")
     print(f"    Use family floors: {best_use_family}")
+    print(f"    Number of features: {best_n_features}")
     print(f"    Best overall score: {best_score:.4f}")
     print(f"  Total evaluations: {total_evals}")
 
@@ -257,6 +303,7 @@ def tune_hyperparameters(
         "runtime_params": base_rt_params,
         "safety_margin": best_margin,
         "use_family_floor": best_use_family,
+        "n_features": best_n_features,
         "best_score": best_score,
     }
 
@@ -341,7 +388,8 @@ def main():
     tune_start = time.time()
 
     best_params = tune_hyperparameters(
-        df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time
+        df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+        feature_names=feature_cols
     )
 
     tune_time = time.time() - tune_start
@@ -352,10 +400,12 @@ def main():
 
     final_cv = leave_one_circuit_out_cv(
         df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+        feature_cols,
         best_params["threshold_params"],
         best_params["runtime_params"],
         best_params["safety_margin"],
         best_params.get("use_family_floor", True),
+        best_params.get("n_features", 30),
     )
 
     analyze_cv_results(final_cv, df)
@@ -363,20 +413,33 @@ def main():
     # ── Step 5: Train final models ─────────────────────────────────────
     print("\n[5/5] Training final models on full data...")
 
-    # Threshold model
+    # Step 5a: Feature selection on full data
+    n_features = best_params.get("n_features", 30)
+    final_selector = FeatureSelector(k=n_features)
+    final_selector.fit(X, y_threshold, y_total_time, feature_cols)
+    X_selected = final_selector.transform(X)
+    selected_feature_names = final_selector.get_selected_names()
+    print(f"  Selected {n_features} features from {len(feature_cols)}")
+
+    # Step 5b: Threshold model on selected features
     final_thr_model = ThresholdModel(
         **best_params["threshold_params"],
         safety_margin=best_params["safety_margin"]
     )
-    final_thr_model.fit(X, y_threshold, calibrate=False)
+    final_thr_model.fit(X_selected, y_threshold, calibrate=False)
 
-    # Runtime model
+    # Step 5c: Runtime model on selected features + thresholds
     final_rt_model = RuntimeModel(**best_params["runtime_params"])
-    final_rt_model.fit(X, y_total_time, y_setup_time, y_per_shot_time)
+    final_rt_model.fit(
+        X_selected, y_total_time, y_threshold,  # Use true thresholds for final training
+        y_setup_time, y_per_shot_time
+    )
 
-    # Combined predictor
+    # Combined predictor with selector
     combined = CombinedPredictor(final_thr_model, final_rt_model)
-    combined.feature_columns = feature_cols
+    combined.feature_columns = feature_cols  # Original feature columns
+    combined.selected_feature_names = selected_feature_names  # Selected features
+    combined.feature_selector = final_selector  # Store selector for prediction
 
     # Save models
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -396,15 +459,26 @@ def main():
         f.write(f"Runtime Model:\n")
         for k, v in best_params["runtime_params"].items():
             f.write(f"  {k}: {v}\n")
+        f.write(f"\nFeature Selection:\n")
+        f.write(f"  n_features: {n_features}\n")
+        f.write(f"  from original: {len(feature_cols)}\n")
         f.write(f"\nCV Score: {best_params['best_score']:.4f}\n")
     print(f"  Saved parameters to: {params_path}")
 
-    # Save feature columns for prediction script
+    # Save feature columns for prediction script (original + selected)
     feature_path = OUTPUT_DIR / "feature_columns.txt"
     with open(feature_path, "w") as f:
         for col in feature_cols:
             f.write(col + "\n")
     print(f"  Saved feature columns to: {feature_path}")
+
+    # Save selected features
+    selected_path = OUTPUT_DIR / "selected_features.txt"
+    with open(selected_path, "w") as f:
+        f.write(f"# Top {n_features} features selected by correlation with targets\n")
+        for col in selected_feature_names:
+            f.write(col + "\n")
+    print(f"  Saved selected features to: {selected_path}")
 
     # ── Summary ────────────────────────────────────────────────────────
     total_time = time.time() - start_time
