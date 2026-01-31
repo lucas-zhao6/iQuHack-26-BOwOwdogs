@@ -18,10 +18,11 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from itertools import product
 
 import numpy as np
 import pandas as pd
+import optuna
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, LeaveOneGroupOut
 
 # Suppress sklearn warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -48,13 +49,14 @@ from src.scoring import (
     find_optimal_safety_margin,
 )
 from src.feature_selection import FeatureSelector
-from src.curve_predictor import FidelityCurvePredictor, extract_curve_targets
-from src.runtime_curve_predictor import RuntimeCurvePredictor, extract_runtime_curves
-from src.auxiliary_features import AuxiliaryFeaturePredictor, extract_auxiliary_targets, EnrichedFeatureBuilder
+from src.auxiliary_features import AuxiliaryFeaturePredictor, extract_auxiliary_targets
 
 # Paths
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
+OPTUNA_TRIALS = 120
+OPTUNA_SPLITS = 5
+VALID_SIZE = 0.2
 
 
 def load_data():
@@ -95,8 +97,9 @@ def prepare_features(df: pd.DataFrame):
     X["is_double"] = (df["precision"] == "double").astype(float)
     feature_cols = feature_cols + ["is_gpu", "is_double"]
 
-    # Fill NaN with column mean
-    X = X.fillna(X.mean())
+    # Fill NaN/inf with column median (more robust for small data)
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True))
 
     # Target vectors
     y_threshold = df["selected_threshold"].values.astype(float)
@@ -105,6 +108,109 @@ def prepare_features(df: pd.DataFrame):
     y_per_shot_time = df["estimated_per_shot_s"].values.astype(float)
 
     return X.values, y_threshold, y_total_time, y_setup_time, y_per_shot_time, feature_cols
+
+
+def split_train_valid_groups(
+    indices: np.ndarray,
+    groups: np.ndarray,
+    valid_size: float = 0.2,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Group-aware train/valid split for early stopping."""
+    unique_groups = np.unique(groups[indices])
+    if len(unique_groups) < 3 or valid_size <= 0:
+        return indices, np.array([], dtype=int)
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=valid_size, random_state=seed)
+    train_local, val_local = next(
+        splitter.split(np.zeros(len(indices)), groups=groups[indices])
+    )
+    return indices[train_local], indices[val_local]
+
+
+def enrich_with_auxiliary_features(
+    X_train: np.ndarray,
+    X_val: np.ndarray | None,
+    X_test: np.ndarray,
+    auxiliary_targets: dict,
+    train_idx: np.ndarray,
+):
+    """Train auxiliary feature predictor and enrich feature matrices."""
+    aux_predictor = AuxiliaryFeaturePredictor(n_estimators=150, max_depth=4, learning_rate=0.05)
+    train_aux = {k: v[train_idx] for k, v in auxiliary_targets.items()}
+    aux_predictor.fit(X_train, train_aux)
+
+    X_train_aux = aux_predictor.predict_as_features(X_train)
+    X_test_aux = aux_predictor.predict_as_features(X_test)
+    X_train_enriched = np.hstack([X_train, X_train_aux])
+    X_test_enriched = np.hstack([X_test, X_test_aux])
+
+    X_val_enriched = None
+    if X_val is not None:
+        X_val_aux = aux_predictor.predict_as_features(X_val)
+        X_val_enriched = np.hstack([X_val, X_val_aux])
+
+    aux_feature_names = [f"pred_{t}" for t in aux_predictor.models.keys()]
+    return X_train_enriched, X_val_enriched, X_test_enriched, aux_predictor, aux_feature_names
+
+
+def can_use_threshold_eval_set(
+    y_train: np.ndarray,
+    y_val: np.ndarray | None,
+) -> bool:
+    """Return True if validation labels are subset of train labels."""
+    if y_val is None or y_val.size == 0:
+        return False
+    train_labels = {threshold_to_idx(v) for v in y_train}
+    val_labels = {threshold_to_idx(v) for v in y_val}
+    return val_labels.issubset(train_labels)
+
+
+def append_runtime_extras(
+    X_rt: np.ndarray,
+    extras: list[np.ndarray],
+) -> np.ndarray:
+    """Append extra runtime features."""
+    if not extras:
+        return X_rt
+    processed = []
+    for extra in extras:
+        if extra.ndim == 1:
+            processed.append(extra.reshape(-1, 1))
+        else:
+            processed.append(extra)
+    return np.hstack([X_rt] + processed)
+
+
+def get_valid_group_splits(
+    X: np.ndarray,
+    y_threshold: np.ndarray,
+    groups: np.ndarray,
+    splitter,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return group splits where training contains all observed labels."""
+    required_labels = {threshold_to_idx(v) for v in y_threshold}
+    valid_splits: list[tuple[np.ndarray, np.ndarray]] = []
+    total_splits = 0
+
+    for train_idx, test_idx in splitter.split(X, y_threshold, groups):
+        total_splits += 1
+        train_labels = {threshold_to_idx(v) for v in y_threshold[train_idx]}
+        if required_labels.issubset(train_labels):
+            valid_splits.append((train_idx, test_idx))
+
+    if not valid_splits:
+        raise ValueError(
+            "No valid group splits contain all threshold labels. "
+            "Reduce n_splits or adjust grouping."
+        )
+
+    if len(valid_splits) < total_splits:
+        print(
+            f"  Using {len(valid_splits)}/{total_splits} splits with full label coverage"
+        )
+
+    return valid_splits
 
 
 def leave_one_circuit_out_cv(
@@ -117,12 +223,15 @@ def leave_one_circuit_out_cv(
     feature_names: list,
     threshold_params: dict,
     runtime_params: dict,
-    safety_margin: float = 0.3,
+    safety_margin: float = 0.0,
     use_family_floor: bool = True,
-    n_features: int = 30,
-    use_curve_predictor: bool = False,
-    use_runtime_curve: bool = False,
-    use_auxiliary_features: bool = False,
+    n_features: int = 40,
+    feature_method: str = "mi",
+    decision_policy: str = "expected_score",
+    use_auxiliary_features: bool = True,
+    valid_size: float = 0.2,
+    splitter=None,
+    splits: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict:
     """
     Perform leave-one-circuit-out cross-validation.
@@ -131,13 +240,16 @@ def leave_one_circuit_out_cv(
     (same circuit, different backend/precision configs).
 
     Key improvements:
-    1. Feature selection fitted on training data only (prevents leakage)
-    2. Sequential prediction: threshold first, then runtime uses predicted threshold
-    3. Innovation 5: Curve predictor safety net for high-threshold families
-    4. Runtime curve prediction: predict runtime at each threshold rung
-    5. Auxiliary feature enrichment: predict sweep-derived features
+    1. Group-aware splits (by circuit)
+    2. Feature selection fitted on training data only (prevents leakage)
+    3. Sequential prediction: threshold first, then runtime uses predicted threshold
+    4. Optional auxiliary feature enrichment
     """
-    circuits = df["file"].unique()
+    groups = df["file"].values
+    if splits is None:
+        if splitter is None:
+            splitter = LeaveOneGroupOut()
+        splits = get_valid_group_splits(X, y_threshold, groups, splitter)
 
     all_pred_thresholds = []
     all_true_thresholds = []
@@ -146,94 +258,120 @@ def leave_one_circuit_out_cv(
     all_indices = []
     all_families = []
 
-    # Extract curve targets if using curve predictor
-    curves = extract_curve_targets(df) if use_curve_predictor else None
-
-    # Extract runtime curves if using runtime curve predictor
-    runtime_curves = extract_runtime_curves(df) if use_runtime_curve else None
-
-    # Extract auxiliary targets if using auxiliary features
     auxiliary_targets = extract_auxiliary_targets(df) if use_auxiliary_features else None
 
-    for i, circuit in enumerate(circuits):
-        # Split: leave out all rows for this circuit
-        test_mask = df["file"] == circuit
-        train_mask = ~test_mask
+    for fold, (train_idx, test_idx) in enumerate(splits):
+        train_idx, val_idx = split_train_valid_groups(
+            train_idx, groups, valid_size=valid_size, seed=42 + fold
+        )
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_thr_train, y_thr_test = y_threshold[train_idx], y_threshold[test_idx]
+        y_time_train, y_time_test = y_total_time[train_idx], y_total_time[test_idx]
+        y_setup_train = y_setup_time[train_idx]
+        y_per_shot_train = y_per_shot_time[train_idx]
 
-        X_train, X_test = X[train_mask], X[test_mask]
-        y_thr_train, y_thr_test = y_threshold[train_mask], y_threshold[test_mask]
-        y_time_train, y_time_test = y_total_time[train_mask], y_total_time[test_mask]
-        y_setup_train = y_setup_time[train_mask]
-        y_per_shot_train = y_per_shot_time[train_mask]
+        X_val = X[val_idx] if val_idx.size > 0 else None
+        y_thr_val = y_threshold[val_idx] if val_idx.size > 0 else None
+        y_time_val = y_total_time[val_idx] if val_idx.size > 0 else None
+        y_setup_val = y_setup_time[val_idx] if val_idx.size > 0 else None
+        y_per_shot_val = y_per_shot_time[val_idx] if val_idx.size > 0 else None
 
-        # Get predicted family for test circuit
-        test_families = df.loc[test_mask, "predicted_family"].tolist()
+        test_families = df.loc[test_idx, "predicted_family"].tolist()
 
         # Optional: Enrich features with predicted auxiliary features
         if use_auxiliary_features and auxiliary_targets is not None:
-            train_aux = {k: v[train_mask] for k, v in auxiliary_targets.items()}
-            aux_predictor = AuxiliaryFeaturePredictor(n_estimators=50, max_depth=3)
-            aux_predictor.fit(X_train, train_aux)
-            # Add predicted auxiliary features to both train and test
-            X_train_aux = aux_predictor.predict_as_features(X_train)
-            X_test_aux = aux_predictor.predict_as_features(X_test)
-            X_train_enriched = np.hstack([X_train, X_train_aux])
-            X_test_enriched = np.hstack([X_test, X_test_aux])
-            enriched_names = feature_names + [f"pred_{t}" for t in aux_predictor.models.keys()]
+            (
+                X_train_enriched,
+                X_val_enriched,
+                X_test_enriched,
+                _aux_predictor,
+                aux_feature_names,
+            ) = enrich_with_auxiliary_features(
+                X_train, X_val, X_test, auxiliary_targets, train_idx
+            )
+            enriched_names = feature_names + aux_feature_names
         else:
-            X_train_enriched, X_test_enriched = X_train, X_test
+            X_train_enriched, X_val_enriched, X_test_enriched = X_train, X_val, X_test
             enriched_names = feature_names
 
         # Step 1: Feature selection (fitted on training data only)
-        selector = FeatureSelector(k=n_features)
+        selector = FeatureSelector(k=n_features, method=feature_method)
         selector.fit(X_train_enriched, y_thr_train, y_time_train, enriched_names)
         X_train_thr = selector.transform_threshold(X_train_enriched)
         X_test_thr = selector.transform_threshold(X_test_enriched)
         X_train_rt = selector.transform_runtime(X_train_enriched)
         X_test_rt = selector.transform_runtime(X_test_enriched)
 
-        # Step 2: Train threshold model on selected features
-        thr_model = ThresholdModel(**threshold_params, safety_margin=safety_margin)
-        thr_model.fit(X_train_thr, y_thr_train, calibrate=False)
-        thr_model.safety_margin = safety_margin
+        X_val_thr = selector.transform_threshold(X_val_enriched) if X_val_enriched is not None else None
+        X_val_rt = selector.transform_runtime(X_val_enriched) if X_val_enriched is not None else None
 
-        # Step 3: Predict thresholds (direct model)
+        # Step 2: Train threshold model on selected features
+        thr_model = ThresholdModel(
+            lgb_params=threshold_params,
+            safety_margin=safety_margin,
+            decision_policy=decision_policy,
+        )
+        thr_eval_set = None
+        if X_val_thr is not None and can_use_threshold_eval_set(y_thr_train, y_thr_val):
+            thr_eval_set = (X_val_thr, y_thr_val)
+        thr_model.fit(X_train_thr, y_thr_train, eval_set=thr_eval_set)
+
+        # Step 3: Predict thresholds
         pred_thresholds = thr_model.predict(X_test_thr)
 
-        # Step 3b: Innovation 5 - Curve predictor safety net for high-threshold families
-        if use_curve_predictor and curves is not None:
-            train_curves = {rung: curves[rung][train_mask] for rung in curves}
-            curve_model = FidelityCurvePredictor(mode='multi_output', n_estimators=100, max_depth=4)
-            curve_model.fit(X_train, train_curves)
-            curve_pred = curve_model.predict_threshold(X_test)
+        # Runtime extras: threshold uncertainty + backend/precision flags
+        train_proba = thr_model.predict_proba(X_train_thr)
+        test_proba = thr_model.predict_proba(X_test_thr)
+        val_proba = thr_model.predict_proba(X_val_thr) if X_val_thr is not None else None
 
-            # For high-threshold families, take max(direct, curve)
-            for j, family in enumerate(test_families):
-                if family in HIGH_THRESHOLD_FAMILIES:
-                    pred_thresholds[j] = max(pred_thresholds[j], curve_pred[j])
+        idxs = np.arange(train_proba.shape[1])
+        train_expected = train_proba @ idxs
+        test_expected = test_proba @ idxs
+        val_expected = val_proba @ idxs if val_proba is not None else None
+
+        train_entropy = -(train_proba * np.log(train_proba + 1e-9)).sum(axis=1)
+        test_entropy = -(test_proba * np.log(test_proba + 1e-9)).sum(axis=1)
+        val_entropy = (
+            -(val_proba * np.log(val_proba + 1e-9)).sum(axis=1)
+            if val_proba is not None
+            else None
+        )
+
+        extra_train = [train_expected, train_entropy]
+        extra_test = [test_expected, test_entropy]
+        extra_val = [val_expected, val_entropy] if val_expected is not None else []
+
+        for flag_name in ["is_gpu", "is_double"]:
+            if flag_name in enriched_names:
+                flag_idx = enriched_names.index(flag_name)
+                extra_train.append(X_train_enriched[:, flag_idx])
+                extra_test.append(X_test_enriched[:, flag_idx])
+                if X_val_enriched is not None:
+                    extra_val.append(X_val_enriched[:, flag_idx])
 
         # Apply family floor (Innovation #3)
         if use_family_floor:
             pred_thresholds = apply_family_floor(pred_thresholds, test_families)
 
         # Step 4: Train runtime model with TRUE thresholds from training data
-        rt_model = RuntimeModel(**runtime_params)
+        rt_model = RuntimeModel(lgb_params=runtime_params)
+        X_train_rt = append_runtime_extras(X_train_rt, extra_train)
+        X_test_rt = append_runtime_extras(X_test_rt, extra_test)
+        if X_val_rt is not None:
+            X_val_rt = append_runtime_extras(X_val_rt, extra_val)
+        rt_eval_set = (
+            (X_val_rt, y_time_val, y_thr_val, y_setup_val, y_per_shot_val)
+            if X_val_rt is not None
+            else None
+        )
         rt_model.fit(
-            X_train_rt, y_time_train, y_thr_train,  # Use true thresholds for training
-            y_setup_train, y_per_shot_train
+            X_train_rt, y_time_train, y_thr_train,
+            y_setup_train, y_per_shot_train,
+            eval_set=rt_eval_set,
         )
 
         # Step 5: Predict runtime using PREDICTED thresholds (sequential prediction)
         pred_times = rt_model.predict(X_test_rt, pred_thresholds)
-
-        # Step 5b: Optional runtime curve prediction for better estimates
-        if use_runtime_curve and runtime_curves is not None:
-            train_rt_curves = {rung: runtime_curves[rung][train_mask] for rung in runtime_curves}
-            rt_curve_model = RuntimeCurvePredictor(n_estimators=100, max_depth=4)
-            rt_curve_model.fit(X_train_enriched, train_rt_curves)
-            curve_pred_times = rt_curve_model.predict_runtime_at_threshold(X_test_enriched, pred_thresholds)
-            # Blend direct and curve predictions (geometric mean for runtime)
-            pred_times = np.sqrt(pred_times * curve_pred_times)
 
         # Collect results
         for j, (pt, tt, ptr, ttr, fam) in enumerate(zip(
@@ -243,7 +381,7 @@ def leave_one_circuit_out_cv(
             all_true_thresholds.append(int(tt))
             all_pred_times.append(float(ptr))
             all_true_times.append(float(ttr))
-            all_indices.append(test_mask.values.nonzero()[0][j])
+            all_indices.append(test_idx[j])
             all_families.append(fam)
 
     # Compute overall score
@@ -263,6 +401,38 @@ def leave_one_circuit_out_cv(
     }
 
 
+def suggest_lgbm_params(
+    trial: optuna.Trial,
+    prefix: str,
+    objective: str,
+    num_class: int | None = None,
+) -> dict:
+    """Suggest LightGBM parameters with strong regularization."""
+    max_depth = trial.suggest_int(f"{prefix}max_depth", 3, 6)
+    max_leaves = min(2 ** max_depth, 63)
+    num_leaves = trial.suggest_int(f"{prefix}num_leaves", max(8, 2 ** (max_depth - 1)), max_leaves)
+    params = {
+        "objective": objective,
+        "max_depth": max_depth,
+        "num_leaves": num_leaves,
+        "learning_rate": trial.suggest_float(f"{prefix}learning_rate", 0.01, 0.08, log=True),
+        "min_child_samples": trial.suggest_int(f"{prefix}min_child_samples", 8, 40),
+        "min_gain_to_split": trial.suggest_float(f"{prefix}min_gain_to_split", 0.0, 0.1),
+        "feature_fraction": trial.suggest_float(f"{prefix}feature_fraction", 0.6, 0.95),
+        "bagging_fraction": trial.suggest_float(f"{prefix}bagging_fraction", 0.6, 0.95),
+        "bagging_freq": trial.suggest_int(f"{prefix}bagging_freq", 1, 5),
+        "lambda_l1": trial.suggest_float(f"{prefix}lambda_l1", 0.0, 6.0),
+        "lambda_l2": trial.suggest_float(f"{prefix}lambda_l2", 0.0, 12.0),
+        "max_bin": trial.suggest_int(f"{prefix}max_bin", 63, 255),
+        "extra_trees": trial.suggest_categorical(f"{prefix}extra_trees", [True, False]),
+        "verbosity": -1,
+        "random_state": 42,
+    }
+    if num_class is not None:
+        params["num_class"] = num_class
+    return params
+
+
 def tune_hyperparameters(
     df: pd.DataFrame,
     X: np.ndarray,
@@ -271,169 +441,75 @@ def tune_hyperparameters(
     y_setup_time: np.ndarray,
     y_per_shot_time: np.ndarray,
     feature_names: list,
-    n_features: int = 30,
+    n_trials: int = 120,
+    n_splits: int = 5,
+    valid_size: float = 0.2,
 ) -> dict:
     """
-    Grid search over hyperparameters using competition score.
+    Bayesian hyperparameter search (Optuna) using competition score.
 
     Returns best parameters for threshold and runtime models.
     """
-    print("\n  Hyperparameter search (focused grid for speed):")
-    print(f"  Using feature selection: {n_features} features from {len(feature_names)}")
+    n_groups = df["file"].nunique()
+    n_splits = min(n_splits, n_groups)
+    splitter = GroupKFold(n_splits=n_splits)
+    split_groups = df["file"].values
+    valid_splits = get_valid_group_splits(X, y_threshold, split_groups, splitter)
 
-    # Focused grid - only tune most impactful params
-    safety_margins = [0.0, 0.3, 0.5, 0.7, 1.0]
+    print("\n  Hyperparameter search (Optuna TPE, group-aware CV):")
+    print(f"  Trials: {n_trials}, CV splits: {n_splits}, features: {len(feature_names)}")
 
-    # Fixed good baseline params (these work well for small datasets)
-    base_thr_params = {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.1, "min_samples_leaf": 3}
-    base_rt_params = {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.1, "min_samples_leaf": 3}
+    def objective(trial: optuna.Trial) -> float:
+        thr_params = suggest_lgbm_params(trial, "thr_", "multiclass", num_class=9)
+        rt_params = suggest_lgbm_params(trial, "rt_", "regression")
 
-    best_score = -1
-    best_margin = 0.3
-    best_use_family = True
-    best_n_features = n_features
-    total_evals = 0
+        n_feat = trial.suggest_int("n_features", 20, min(80, len(feature_names)))
+        use_family_floor = trial.suggest_categorical("use_family_floor", [True, False])
+        feature_method = trial.suggest_categorical("feature_method", ["mi", "corr"])
+        decision_policy = trial.suggest_categorical("decision_policy", ["expected_score", "argmax"])
+        safety_margin = trial.suggest_float("safety_margin", 0.0, 2.0, step=0.5)
 
-    # First compare with vs without family floors
-    print("\n  Comparing family floor strategies:")
-    for use_family in [False, True]:
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=0.0, use_family_floor=use_family, n_features=n_features
+            feature_names, thr_params, rt_params,
+            safety_margin=safety_margin,
+            use_family_floor=use_family_floor,
+            n_features=n_feat,
+            feature_method=feature_method,
+            decision_policy=decision_policy,
+            use_auxiliary_features=True,
+            valid_size=valid_size,
+            splits=valid_splits,
         )
-        score = result["scores"]["overall_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        label = "WITH family floors" if use_family else "WITHOUT family floors"
-        print(f"    {label}: score={score:.4f}, failures={n_fail}")
-        total_evals += 1
+        return result["scores"]["overall_score"]
 
-    # Tune safety margin WITH family floors (our innovation)
-    print(f"\n  Tuning safety margin WITH family floors:")
-    for margin in safety_margins:
-        result = leave_one_circuit_out_cv(
-            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=margin, use_family_floor=True, n_features=n_features
-        )
-        score = result["scores"]["overall_score"]
-        thr_score = result["scores"]["mean_threshold_score"]
-        rt_score = result["scores"]["mean_runtime_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        print(f"    margin={margin:.1f}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
-        if score > best_score:
-            best_score = score
-            best_margin = margin
-            best_use_family = True
-        total_evals += 1
+    sampler = optuna.samplers.TPESampler(seed=42)
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=max(5, n_splits))
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+    study.optimize(objective, n_trials=n_trials)
 
-    # Optionally try different feature counts
-    print(f"\n  Tuning number of features (with best margin={best_margin}):")
-    for n_feat in [20, 25, 30, 40]:
-        if n_feat == n_features:
-            continue  # Already evaluated
-        result = leave_one_circuit_out_cv(
-            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=best_margin, use_family_floor=True, n_features=n_feat
-        )
-        score = result["scores"]["overall_score"]
-        thr_score = result["scores"]["mean_threshold_score"]
-        rt_score = result["scores"]["mean_runtime_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        print(f"    n_features={n_feat}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
-        if score > best_score:
-            best_score = score
-            best_n_features = n_feat
-        total_evals += 1
+    best_params = study.best_trial.params
+    best_thr_params = {k.replace("thr_", ""): v for k, v in best_params.items() if k.startswith("thr_")}
+    best_rt_params = {k.replace("rt_", ""): v for k, v in best_params.items() if k.startswith("rt_")}
 
-    # Innovation 5: Test curve predictor safety net
-    print(f"\n  Testing curve predictor safety net (Innovation 5):")
-    best_use_curve = False
-    for use_curve in [False, True]:
-        result = leave_one_circuit_out_cv(
-            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
-            use_curve_predictor=use_curve
-        )
-        score = result["scores"]["overall_score"]
-        thr_score = result["scores"]["mean_threshold_score"]
-        rt_score = result["scores"]["mean_runtime_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        label = "WITH curve predictor" if use_curve else "WITHOUT curve predictor"
-        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
-        if score > best_score:
-            best_score = score
-            best_use_curve = use_curve
-        # Prefer curve predictor if similar score but fewer failures
-        elif abs(score - best_score) < 0.02 and use_curve and n_fail < result["scores"]["n_threshold_failures"]:
-            best_use_curve = True
-        total_evals += 1
-
-    # Test runtime curve predictor
-    print(f"\n  Testing runtime curve predictor:")
-    best_use_runtime_curve = False
-    for use_rt_curve in [False, True]:
-        result = leave_one_circuit_out_cv(
-            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
-            use_curve_predictor=best_use_curve, use_runtime_curve=use_rt_curve
-        )
-        score = result["scores"]["overall_score"]
-        thr_score = result["scores"]["mean_threshold_score"]
-        rt_score = result["scores"]["mean_runtime_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        label = "WITH runtime curve" if use_rt_curve else "WITHOUT runtime curve"
-        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
-        if score > best_score:
-            best_score = score
-            best_use_runtime_curve = use_rt_curve
-        total_evals += 1
-
-    # Test auxiliary feature enrichment
-    print(f"\n  Testing auxiliary feature enrichment:")
-    best_use_aux = False
-    for use_aux in [False, True]:
-        result = leave_one_circuit_out_cv(
-            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
-            use_curve_predictor=best_use_curve, use_runtime_curve=best_use_runtime_curve,
-            use_auxiliary_features=use_aux
-        )
-        score = result["scores"]["overall_score"]
-        thr_score = result["scores"]["mean_threshold_score"]
-        rt_score = result["scores"]["mean_runtime_score"]
-        n_fail = result["scores"]["n_threshold_failures"]
-        label = "WITH aux features" if use_aux else "WITHOUT aux features"
-        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
-        if score > best_score:
-            best_score = score
-            best_use_aux = use_aux
-        total_evals += 1
-
-    print(f"\n  Best configuration:")
-    print(f"    Safety margin: {best_margin}")
-    print(f"    Use family floors: {best_use_family}")
-    print(f"    Number of features: {best_n_features}")
-    print(f"    Use curve predictor: {best_use_curve}")
-    print(f"    Use runtime curve: {best_use_runtime_curve}")
-    print(f"    Use auxiliary features: {best_use_aux}")
-    print(f"    Best overall score: {best_score:.4f}")
-    print(f"  Total evaluations: {total_evals}")
+    print(f"\n  Best configuration (score={study.best_value:.4f}):")
+    print(f"    Safety margin: {best_params['safety_margin']}")
+    print(f"    Use family floors: {best_params['use_family_floor']}")
+    print(f"    Feature method: {best_params['feature_method']}")
+    print(f"    Decision policy: {best_params['decision_policy']}")
+    print(f"    Number of features: {best_params['n_features']}")
 
     return {
-        "threshold_params": base_thr_params,
-        "runtime_params": base_rt_params,
-        "safety_margin": best_margin,
-        "use_family_floor": best_use_family,
-        "n_features": best_n_features,
-        "use_curve_predictor": best_use_curve,
-        "use_runtime_curve": best_use_runtime_curve,
-        "use_auxiliary_features": best_use_aux,
-        "best_score": best_score,
+        "threshold_params": best_thr_params,
+        "runtime_params": best_rt_params,
+        "safety_margin": best_params["safety_margin"],
+        "use_family_floor": best_params["use_family_floor"],
+        "feature_method": best_params["feature_method"],
+        "decision_policy": best_params["decision_policy"],
+        "n_features": best_params["n_features"],
+        "use_auxiliary_features": True,
+        "best_score": study.best_value,
+        "n_trials": len(study.trials),
     }
 
 
@@ -518,7 +594,10 @@ def main():
 
     best_params = tune_hyperparameters(
         df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-        feature_names=feature_cols
+        feature_names=feature_cols,
+        n_trials=OPTUNA_TRIALS,
+        n_splits=OPTUNA_SPLITS,
+        valid_size=VALID_SIZE,
     )
 
     tune_time = time.time() - tune_start
@@ -527,17 +606,23 @@ def main():
     # ── Step 4: Final CV evaluation ────────────────────────────────────
     print("\n[4/5] Final cross-validation evaluation...")
 
+    n_groups = df["file"].nunique()
+    final_splitter = GroupKFold(n_splits=min(OPTUNA_SPLITS, n_groups))
+    final_splits = get_valid_group_splits(X, y_threshold, df["file"].values, final_splitter)
+
     final_cv = leave_one_circuit_out_cv(
         df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
         feature_cols,
         best_params["threshold_params"],
         best_params["runtime_params"],
-        best_params["safety_margin"],
-        best_params.get("use_family_floor", True),
-        best_params.get("n_features", 30),
-        best_params.get("use_curve_predictor", False),
-        best_params.get("use_runtime_curve", False),
-        best_params.get("use_auxiliary_features", False),
+        safety_margin=best_params.get("safety_margin", 0.0),
+        use_family_floor=best_params.get("use_family_floor", True),
+        n_features=best_params.get("n_features", 40),
+        feature_method=best_params.get("feature_method", "mi"),
+        decision_policy=best_params.get("decision_policy", "expected_score"),
+        use_auxiliary_features=best_params.get("use_auxiliary_features", True),
+        valid_size=VALID_SIZE,
+        splits=final_splits,
     )
 
     analyze_cv_results(final_cv, df)
@@ -546,23 +631,41 @@ def main():
     print("\n[5/5] Training final models on full data...")
 
     # Step 5a: Optional auxiliary feature enrichment
-    n_features = best_params.get("n_features", 30)
+    n_features = best_params.get("n_features", 40)
+    feature_method = best_params.get("feature_method", "mi")
+    decision_policy = best_params.get("decision_policy", "expected_score")
     X_enriched = X.copy()
     enriched_feature_cols = feature_cols.copy()
     final_aux_predictor = None
 
-    if best_params.get("use_auxiliary_features", False):
+    if best_params.get("use_auxiliary_features", True):
         print("  Training auxiliary feature predictor...")
         auxiliary_targets = extract_auxiliary_targets(df)
-        final_aux_predictor = AuxiliaryFeaturePredictor(n_estimators=50, max_depth=3)
+        final_aux_predictor = AuxiliaryFeaturePredictor(n_estimators=150, max_depth=4, learning_rate=0.05)
         final_aux_predictor.fit(X, auxiliary_targets)
         X_aux = final_aux_predictor.predict_as_features(X)
         X_enriched = np.hstack([X, X_aux])
         enriched_feature_cols = feature_cols + [f"pred_{t}" for t in final_aux_predictor.models.keys()]
         print(f"  Added {X_aux.shape[1]} predicted auxiliary features")
 
+    groups = df["file"].values
+    train_idx_final, val_idx_final = split_train_valid_groups(
+        np.arange(len(df)), groups, valid_size=VALID_SIZE, seed=123
+    )
+
+    X_train_enriched = X_enriched[train_idx_final]
+    X_val_enriched = X_enriched[val_idx_final] if val_idx_final.size > 0 else None
+    y_thr_train = y_threshold[train_idx_final]
+    y_thr_val = y_threshold[val_idx_final] if val_idx_final.size > 0 else None
+    y_time_train = y_total_time[train_idx_final]
+    y_time_val = y_total_time[val_idx_final] if val_idx_final.size > 0 else None
+    y_setup_train = y_setup_time[train_idx_final]
+    y_setup_val = y_setup_time[val_idx_final] if val_idx_final.size > 0 else None
+    y_per_shot_train = y_per_shot_time[train_idx_final]
+    y_per_shot_val = y_per_shot_time[val_idx_final] if val_idx_final.size > 0 else None
+
     # Step 5b: Feature selection on (possibly enriched) data
-    final_selector = FeatureSelector(k=n_features)
+    final_selector = FeatureSelector(k=n_features, method=feature_method)
     final_selector.fit(X_enriched, y_threshold, y_total_time, enriched_feature_cols)
     X_selected_thr = final_selector.transform_threshold(X_enriched)
     X_selected_rt = final_selector.transform_runtime(X_enriched)
@@ -571,28 +674,57 @@ def main():
     print(f"  Selected {n_features} threshold features from {len(enriched_feature_cols)}")
     print(f"  Selected {n_features} runtime features from {len(enriched_feature_cols)}")
 
+    X_thr_train = X_selected_thr[train_idx_final]
+    X_rt_train = X_selected_rt[train_idx_final]
+    X_thr_val = X_selected_thr[val_idx_final] if val_idx_final.size > 0 else None
+    X_rt_val = X_selected_rt[val_idx_final] if val_idx_final.size > 0 else None
+
     # Step 5c: Threshold model on selected features
     final_thr_model = ThresholdModel(
-        **best_params["threshold_params"],
-        safety_margin=best_params["safety_margin"]
+        lgb_params=best_params["threshold_params"],
+        safety_margin=best_params.get("safety_margin", 0.0),
+        decision_policy=decision_policy,
     )
-    final_thr_model.fit(X_selected_thr, y_threshold, calibrate=False)
+    final_thr_eval = None
+    if X_thr_val is not None and can_use_threshold_eval_set(y_thr_train, y_thr_val):
+        final_thr_eval = (X_thr_val, y_thr_val)
+    final_thr_model.fit(X_thr_train, y_thr_train, eval_set=final_thr_eval)
 
     # Step 5d: Runtime model on selected features + thresholds
-    final_rt_model = RuntimeModel(**best_params["runtime_params"])
-    final_rt_model.fit(
-        X_selected_rt, y_total_time, y_threshold,  # Use true thresholds for final training
-        y_setup_time, y_per_shot_time
-    )
+    final_rt_model = RuntimeModel(lgb_params=best_params["runtime_params"])
+    train_proba = final_thr_model.predict_proba(X_thr_train)
+    idxs = np.arange(train_proba.shape[1])
+    train_expected = train_proba @ idxs
+    train_entropy = -(train_proba * np.log(train_proba + 1e-9)).sum(axis=1)
+    extra_train = [train_expected, train_entropy]
 
-    # Step 5e: Optional runtime curve predictor
-    final_rt_curve_predictor = None
-    if best_params.get("use_runtime_curve", False):
-        print("  Training runtime curve predictor...")
-        runtime_curves = extract_runtime_curves(df)
-        final_rt_curve_predictor = RuntimeCurvePredictor(n_estimators=100, max_depth=4)
-        final_rt_curve_predictor.fit(X_enriched, runtime_curves)
-        print(f"  Runtime curve predictor trained on {len(runtime_curves)} rungs")
+    extra_val = []
+    if X_thr_val is not None:
+        val_proba = final_thr_model.predict_proba(X_thr_val)
+        val_expected = val_proba @ idxs
+        val_entropy = -(val_proba * np.log(val_proba + 1e-9)).sum(axis=1)
+        extra_val = [val_expected, val_entropy]
+
+    for flag_name in ["is_gpu", "is_double"]:
+        if flag_name in enriched_feature_cols:
+            flag_idx = enriched_feature_cols.index(flag_name)
+            extra_train.append(X_enriched[train_idx_final][:, flag_idx])
+            if X_val_enriched is not None:
+                extra_val.append(X_val_enriched[:, flag_idx])
+
+    X_rt_train = append_runtime_extras(X_rt_train, extra_train)
+    if X_rt_val is not None:
+        X_rt_val = append_runtime_extras(X_rt_val, extra_val)
+
+    final_rt_model.fit(
+        X_rt_train, y_time_train, y_thr_train,  # Use true thresholds for training
+        y_setup_train, y_per_shot_train,
+        eval_set=(
+            (X_rt_val, y_time_val, y_thr_val, y_setup_val, y_per_shot_val)
+            if X_rt_val is not None
+            else None
+        ),
+    )
 
     # Combined predictor with selector
     combined = CombinedPredictor(final_thr_model, final_rt_model)
@@ -607,19 +739,6 @@ def main():
         combined.aux_predictor = final_aux_predictor
         print("  Auxiliary predictor stored in model")
 
-    # Store runtime curve predictor if enabled
-    if final_rt_curve_predictor is not None:
-        combined.rt_curve_predictor = final_rt_curve_predictor
-        print("  Runtime curve predictor stored in model")
-
-    # Step 5f: Train fidelity curve predictor if enabled (Innovation 5)
-    if best_params.get("use_curve_predictor", False):
-        print("  Training fidelity curve predictor (Innovation 5)...")
-        curves = extract_curve_targets(df)
-        final_curve_predictor = FidelityCurvePredictor(mode='multi_output', n_estimators=100, max_depth=4)
-        final_curve_predictor.fit(X_enriched, curves)
-        combined.curve_predictor = final_curve_predictor
-        print("  Fidelity curve predictor trained successfully")
 
     # Save models
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -636,17 +755,17 @@ def main():
             f.write(f"  {k}: {v}\n")
         f.write(f"  safety_margin: {best_params['safety_margin']}\n")
         f.write(f"  use_family_floor: {best_params.get('use_family_floor', True)}\n\n")
+        f.write(f"  decision_policy: {best_params.get('decision_policy', 'expected_score')}\n\n")
         f.write(f"Runtime Model:\n")
         for k, v in best_params["runtime_params"].items():
             f.write(f"  {k}: {v}\n")
         f.write(f"\nFeature Selection:\n")
         f.write(f"  n_features: {n_features}\n")
+        f.write(f"  method: {best_params.get('feature_method', 'mi')}\n")
         f.write(f"  from original: {len(feature_cols)}\n")
         f.write(f"  enriched features: {len(enriched_feature_cols)}\n")
         f.write(f"\nEnhancements:\n")
-        f.write(f"  use_curve_predictor (fidelity): {best_params.get('use_curve_predictor', False)}\n")
-        f.write(f"  use_runtime_curve: {best_params.get('use_runtime_curve', False)}\n")
-        f.write(f"  use_auxiliary_features: {best_params.get('use_auxiliary_features', False)}\n")
+        f.write(f"  use_auxiliary_features: {best_params.get('use_auxiliary_features', True)}\n")
         f.write(f"\nCV Score: {best_params['best_score']:.4f}\n")
     print(f"  Saved parameters to: {params_path}")
 
@@ -660,14 +779,14 @@ def main():
     # Save selected features
     selected_thr_path = OUTPUT_DIR / "selected_features_threshold.txt"
     with open(selected_thr_path, "w") as f:
-        f.write(f"# Top {n_features} threshold features selected by correlation\n")
+        f.write(f"# Top {n_features} threshold features selected by {feature_method}\n")
         for col in selected_feature_names_thr:
             f.write(col + "\n")
     print(f"  Saved threshold features to: {selected_thr_path}")
 
     selected_rt_path = OUTPUT_DIR / "selected_features_runtime.txt"
     with open(selected_rt_path, "w") as f:
-        f.write(f"# Top {n_features} runtime features selected by correlation\n")
+        f.write(f"# Top {n_features} runtime features selected by {feature_method}\n")
         for col in selected_feature_names_rt:
             f.write(col + "\n")
     print(f"  Saved runtime features to: {selected_rt_path}")

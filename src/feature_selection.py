@@ -68,6 +68,46 @@ def select_features_by_correlation(
     return selected_indices, selected_names, correlations
 
 
+def select_features_by_mutual_info(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: List[str],
+    k: int = 25,
+    min_variance: float = 1e-6,
+    random_state: int = 42,
+) -> Tuple[List[int], List[str], Dict[str, float]]:
+    """
+    Select top K features by mutual information with target.
+    """
+    n_features = X.shape[1]
+    scores = {name: 0.0 for name in feature_names}
+
+    valid_indices = []
+    for i in range(n_features):
+        col = X[:, i]
+        if np.std(col) < min_variance:
+            continue
+        if not np.isfinite(col).any():
+            continue
+        valid_indices.append(i)
+
+    if len(valid_indices) > 0:
+        X_valid = X[:, valid_indices]
+        y_valid = y.copy()
+        mask = np.isfinite(y_valid)
+        if mask.sum() > 5:
+            mi = mutual_info_regression(
+                X_valid[mask], y_valid[mask], random_state=random_state
+            )
+            for idx, val in zip(valid_indices, mi):
+                scores[feature_names[idx]] = float(val)
+
+    sorted_features = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    selected_names = [f[0] for f in sorted_features[:k]]
+    selected_indices = [feature_names.index(name) for name in selected_names]
+    return selected_indices, selected_names, scores
+
+
 def select_features_combined(
     X: np.ndarray,
     y_threshold: np.ndarray,
@@ -105,16 +145,25 @@ def select_features_split(
     feature_names: List[str],
     k_threshold: int = 30,
     k_runtime: int = 30,
+    method: str = "corr",
 ) -> Tuple[List[int], List[str], List[int], List[str]]:
     """
     Select separate feature sets for threshold and runtime prediction.
     """
-    _, _, corr_thr = select_features_by_correlation(
-        X, y_threshold, feature_names, k=len(feature_names)
-    )
-    _, _, corr_rt = select_features_by_correlation(
-        X, y_runtime, feature_names, k=len(feature_names)
-    )
+    if method == "mi":
+        _, _, corr_thr = select_features_by_mutual_info(
+            X, y_threshold, feature_names, k=len(feature_names)
+        )
+        _, _, corr_rt = select_features_by_mutual_info(
+            X, y_runtime, feature_names, k=len(feature_names)
+        )
+    else:
+        _, _, corr_thr = select_features_by_correlation(
+            X, y_threshold, feature_names, k=len(feature_names)
+        )
+        _, _, corr_rt = select_features_by_correlation(
+            X, y_runtime, feature_names, k=len(feature_names)
+        )
 
     thr_sorted = sorted(corr_thr.items(), key=lambda x: x[1], reverse=True)
     rt_sorted = sorted(corr_rt.items(), key=lambda x: x[1], reverse=True)
@@ -133,9 +182,16 @@ class FeatureSelector:
     Supports split selection (different feature sets for threshold vs runtime).
     """
 
-    def __init__(self, k: int = 30, k_threshold: int | None = None, k_runtime: int | None = None):
+    def __init__(
+        self,
+        k: int = 30,
+        k_threshold: int | None = None,
+        k_runtime: int | None = None,
+        method: str = "corr",
+    ):
         self.k_threshold = k_threshold if k_threshold is not None else k
         self.k_runtime = k_runtime if k_runtime is not None else k
+        self.method = method
         self.selected_indices_threshold: List[int] = []
         self.selected_names_threshold: List[str] = []
         self.selected_indices_runtime: List[int] = []
@@ -165,6 +221,7 @@ class FeatureSelector:
         ) = select_features_split(
             X, y_thr_log, y_rt_log, feature_names,
             k_threshold=self.k_threshold, k_runtime=self.k_runtime,
+            method=self.method,
         )
         self._fitted = True
 
