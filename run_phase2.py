@@ -39,13 +39,11 @@ from src.models import (
     FAMILY_THRESHOLD_FLOORS,
 )
 from src.scoring import (
-    compute_overall_score,
-    compute_threshold_score,
-    compute_runtime_score,
     threshold_to_idx,
     idx_to_threshold,
     find_optimal_safety_margin,
 )
+from src.evaluation import leave_one_circuit_out_cv, analyze_cv_results
 from src.feature_selection import FeatureSelector
 
 # Paths
@@ -103,55 +101,23 @@ def prepare_features(df: pd.DataFrame):
     return X.values, y_threshold, y_total_time, y_setup_time, y_per_shot_time, feature_cols
 
 
-def leave_one_circuit_out_cv(
-    df: pd.DataFrame,
-    X: np.ndarray,
-    y_threshold: np.ndarray,
-    y_total_time: np.ndarray,
-    y_setup_time: np.ndarray,
-    y_per_shot_time: np.ndarray,
+def _fit_predict_factory(
     feature_names: list,
     threshold_params: dict,
     runtime_params: dict,
-    safety_margin: float = 0.3,
-    use_family_floor: bool = True,
-    n_features: int = 30,
-) -> dict:
-    """
-    Perform leave-one-circuit-out cross-validation.
-
-    This is critical because rows from the same circuit are correlated
-    (same circuit, different backend/precision configs).
-
-    Key improvements:
-    1. Feature selection fitted on training data only (prevents leakage)
-    2. Sequential prediction: threshold first, then runtime uses predicted threshold
-    """
-    circuits = df["file"].unique()
-    n_circuits = len(circuits)
-
-    all_pred_thresholds = []
-    all_true_thresholds = []
-    all_pred_times = []
-    all_true_times = []
-    all_indices = []
-    all_families = []
-
-    for i, circuit in enumerate(circuits):
-        # Split: leave out all rows for this circuit
-        test_mask = df["file"] == circuit
-        train_mask = ~test_mask
-
-        X_train, X_test = X[train_mask], X[test_mask]
-        y_thr_train, y_thr_test = y_threshold[train_mask], y_threshold[test_mask]
-        y_time_train, y_time_test = y_total_time[train_mask], y_total_time[test_mask]
-        y_setup_train = y_setup_time[train_mask]
-        y_per_shot_train = y_per_shot_time[train_mask]
-
-        # Get predicted family for test circuit
-        test_families = df.loc[test_mask, "predicted_family"].tolist()
-
-        # Step 1: Feature selection (fitted on training data only)
+    safety_margin: float,
+    use_family_floor: bool,
+    n_features: int,
+):
+    def _fit_predict(
+        X_train: np.ndarray,
+        X_test: np.ndarray,
+        y_thr_train: np.ndarray,
+        y_time_train: np.ndarray,
+        y_setup_train: np.ndarray,
+        y_per_shot_train: np.ndarray,
+        test_families: list[str],
+    ):
         selector = FeatureSelector(k=n_features)
         selector.fit(X_train, y_thr_train, y_time_train, feature_names)
         X_train_thr = selector.transform_threshold(X_train)
@@ -159,54 +125,23 @@ def leave_one_circuit_out_cv(
         X_train_rt = selector.transform_runtime(X_train)
         X_test_rt = selector.transform_runtime(X_test)
 
-        # Step 2: Train threshold model on selected features
         thr_model = ThresholdModel(**threshold_params, safety_margin=safety_margin)
         thr_model.fit(X_train_thr, y_thr_train, calibrate=False)
         thr_model.safety_margin = safety_margin
-
-        # Step 3: Predict thresholds (needed before runtime prediction)
         pred_thresholds = thr_model.predict(X_test_thr)
 
-        # Apply family floor (Innovation #3)
         if use_family_floor:
             pred_thresholds = apply_family_floor(pred_thresholds, test_families)
 
-        # Step 4: Train runtime model with TRUE thresholds from training data
         rt_model = RuntimeModel(**runtime_params)
         rt_model.fit(
-            X_train_rt, y_time_train, y_thr_train,  # Use true thresholds for training
+            X_train_rt, y_time_train, y_thr_train,
             y_setup_train, y_per_shot_train
         )
-
-        # Step 5: Predict runtime using PREDICTED thresholds (sequential prediction)
         pred_times = rt_model.predict(X_test_rt, pred_thresholds)
+        return pred_thresholds, pred_times
 
-        # Collect results
-        for j, (pt, tt, ptr, ttr, fam) in enumerate(zip(
-            pred_thresholds, y_thr_test, pred_times, y_time_test, test_families
-        )):
-            all_pred_thresholds.append(int(pt))
-            all_true_thresholds.append(int(tt))
-            all_pred_times.append(float(ptr))
-            all_true_times.append(float(ttr))
-            all_indices.append(test_mask.values.nonzero()[0][j])
-            all_families.append(fam)
-
-    # Compute overall score
-    scores = compute_overall_score(
-        all_pred_thresholds, all_pred_times,
-        all_true_thresholds, all_true_times
-    )
-
-    return {
-        "scores": scores,
-        "pred_thresholds": all_pred_thresholds,
-        "true_thresholds": all_true_thresholds,
-        "pred_times": all_pred_times,
-        "true_times": all_true_times,
-        "indices": all_indices,
-        "families": all_families,
-    }
+    return _fit_predict
 
 
 def tune_hyperparameters(
@@ -243,10 +178,12 @@ def tune_hyperparameters(
     # First compare with vs without family floors
     print("\n  Comparing family floor strategies:")
     for use_family in [False, True]:
+        fit_predict = _fit_predict_factory(
+            feature_names, base_thr_params, base_rt_params, 0.0, use_family, n_features
+        )
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=0.0, use_family_floor=use_family, n_features=n_features
+            fit_predict
         )
         score = result["scores"]["overall_score"]
         n_fail = result["scores"]["n_threshold_failures"]
@@ -257,10 +194,12 @@ def tune_hyperparameters(
     # Tune safety margin WITH family floors (our innovation)
     print(f"\n  Tuning safety margin WITH family floors:")
     for margin in safety_margins:
+        fit_predict = _fit_predict_factory(
+            feature_names, base_thr_params, base_rt_params, margin, True, n_features
+        )
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=margin, use_family_floor=True, n_features=n_features
+            fit_predict
         )
         score = result["scores"]["overall_score"]
         thr_score = result["scores"]["mean_threshold_score"]
@@ -278,10 +217,12 @@ def tune_hyperparameters(
     for n_feat in [20, 25, 30, 40]:
         if n_feat == n_features:
             continue  # Already evaluated
+        fit_predict = _fit_predict_factory(
+            feature_names, base_thr_params, base_rt_params, best_margin, True, n_feat
+        )
         result = leave_one_circuit_out_cv(
             df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
-            feature_names, base_thr_params, base_rt_params,
-            safety_margin=best_margin, use_family_floor=True, n_features=n_feat
+            fit_predict
         )
         score = result["scores"]["overall_score"]
         thr_score = result["scores"]["mean_threshold_score"]
@@ -310,52 +251,6 @@ def tune_hyperparameters(
     }
 
 
-def analyze_cv_results(cv_result: dict, df: pd.DataFrame):
-    """Print detailed analysis of CV results."""
-    scores = cv_result["scores"]
-
-    print(f"\n  Overall competition score: {scores['overall_score']:.4f}")
-    print(f"  Mean threshold score: {scores['mean_threshold_score']:.4f}")
-    print(f"  Mean runtime score: {scores['mean_runtime_score']:.4f}")
-    print(f"  Threshold failures (score=0): {scores['n_threshold_failures']}/{scores['n_tasks']}")
-
-    # Per-circuit analysis
-    pred_thr = np.array(cv_result["pred_thresholds"])
-    true_thr = np.array(cv_result["true_thresholds"])
-    pred_time = np.array(cv_result["pred_times"])
-    true_time = np.array(cv_result["true_times"])
-    indices = cv_result["indices"]
-
-    # Find worst predictions
-    task_scores = []
-    for pt, tt, ptr, ttr in zip(pred_thr, true_thr, pred_time, true_time):
-        thr_score = compute_threshold_score(pt, tt)
-        rt_score = compute_runtime_score(ptr, ttr)
-        task_scores.append(thr_score * rt_score)
-
-    task_scores = np.array(task_scores)
-    worst_indices = np.argsort(task_scores)[:5]
-
-    print("\n  Worst 5 predictions:")
-    for idx in worst_indices:
-        orig_idx = indices[idx]
-        row = df.iloc[orig_idx]
-        thr_score = compute_threshold_score(pred_thr[idx], true_thr[idx])
-        rt_score = compute_runtime_score(pred_time[idx], true_time[idx])
-        print(f"    {row['file'][:30]:<30} {row['backend']:>3}/{row['precision']:<6} "
-              f"thr: {int(true_thr[idx]):>3} -> {int(pred_thr[idx]):>3} (score={thr_score:.2f}), "
-              f"time: {true_time[idx]:>7.1f} -> {pred_time[idx]:>7.1f} (score={rt_score:.2f})")
-
-    # Threshold confusion matrix
-    print("\n  Threshold prediction summary:")
-    unique_thresholds = sorted(set(true_thr.astype(int)))
-    for thr in unique_thresholds:
-        mask = true_thr == thr
-        preds = pred_thr[mask]
-        under = (preds < thr).sum()
-        exact = (preds == thr).sum()
-        over = (preds > thr).sum()
-        print(f"    True={thr:>3}: under={under:>2}, exact={exact:>2}, over={over:>2}")
 
 
 def main():
@@ -400,14 +295,17 @@ def main():
     # ── Step 4: Final CV evaluation ────────────────────────────────────
     print("\n[4/5] Final cross-validation evaluation...")
 
-    final_cv = leave_one_circuit_out_cv(
-        df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+    final_fit_predict = _fit_predict_factory(
         feature_cols,
         best_params["threshold_params"],
         best_params["runtime_params"],
         best_params["safety_margin"],
         best_params.get("use_family_floor", True),
         best_params.get("n_features", 30),
+    )
+    final_cv = leave_one_circuit_out_cv(
+        df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+        final_fit_predict,
     )
 
     analyze_cv_results(final_cv, df)
