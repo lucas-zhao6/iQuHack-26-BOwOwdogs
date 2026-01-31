@@ -20,6 +20,7 @@ from .mps_features import (
     compute_gate_span_features,
     compute_depth_features,
     compute_entanglement_layer_features,
+    compute_linear_cut_metrics,
 )
 from .graph_features import (
     compute_graph_features,
@@ -32,6 +33,10 @@ from .data_loader import (
     build_circuit_metadata,
     build_results_dataframe,
 )
+
+# Feature toggles
+ENABLE_EXPANSION_STRUCTURE_FEATURES = False
+ENABLE_MPS_LINEAR_CUT_FEATURES = True
 
 
 def extract_circuit_features(circuit: ParsedCircuit) -> Dict[str, Any]:
@@ -65,6 +70,11 @@ def extract_circuit_features(circuit: ParsedCircuit) -> Dict[str, Any]:
     cut_pressure = compute_cut_pressure(circuit)
     features.update(cut_pressure)
 
+    # Linear-order cut metrics (~2 features)
+    if ENABLE_MPS_LINEAR_CUT_FEATURES:
+        linear_cut = compute_linear_cut_metrics(circuit)
+        features.update(linear_cut)
+
     # Gate span features (~5 features)
     span_feats = compute_gate_span_features(circuit)
     features.update(span_feats)
@@ -78,7 +88,10 @@ def extract_circuit_features(circuit: ParsedCircuit) -> Dict[str, Any]:
     features.update(ent_feats)
 
     # Graph features (~16 features)
-    graph_feats = compute_graph_features(circuit)
+    graph_feats = compute_graph_features(
+        circuit,
+        include_expansion_structure=ENABLE_EXPANSION_STRUCTURE_FEATURES,
+    )
     features.update(graph_feats)
 
     # Parameter statistics (~6 features)

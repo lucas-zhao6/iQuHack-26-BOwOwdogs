@@ -100,6 +100,53 @@ def compute_cut_pressure(circuit: ParsedCircuit) -> Dict[str, float]:
     }
 
 
+def compute_linear_cut_metrics(circuit: ParsedCircuit) -> Dict[str, float]:
+    """
+    Compute linear-order cut metrics for tensor-network/MPS intuition.
+
+    - edge_cutwidth_natural: max # of UNIQUE interaction edges crossing a cut
+    - entangling_cutwidth_natural: max # of entangling gates crossing a cut
+      (counts multiplicity of gates)
+    """
+    n = circuit.total_qubits
+    if n <= 1:
+        return {
+            "edge_cutwidth_natural": 0.0,
+            "entangling_cutwidth_natural": 0.0,
+        }
+
+    edges = _get_two_qubit_edges(circuit)
+    if not edges:
+        return {
+            "edge_cutwidth_natural": 0.0,
+            "entangling_cutwidth_natural": 0.0,
+        }
+
+    unique_edges = {(min(i, j), max(i, j)) for i, j in edges}
+
+    max_edge_cut = 0
+    max_gate_cut = 0
+    for cut in range(1, n):
+        edge_cross = 0
+        gate_cross = 0
+        for i, j in unique_edges:
+            if i < cut <= j:
+                edge_cross += 1
+        for i, j in edges:
+            lo, hi = (i, j) if i <= j else (j, i)
+            if lo < cut <= hi:
+                gate_cross += 1
+        if edge_cross > max_edge_cut:
+            max_edge_cut = edge_cross
+        if gate_cross > max_gate_cut:
+            max_gate_cut = gate_cross
+
+    return {
+        "edge_cutwidth_natural": float(max_edge_cut),
+        "entangling_cutwidth_natural": float(max_gate_cut),
+    }
+
+
 def compute_gate_span_features(circuit: ParsedCircuit) -> Dict[str, float]:
     """
     Compute statistics about the 'span' of two-qubit gates.
