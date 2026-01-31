@@ -284,6 +284,13 @@ class CombinedPredictor:
 
     Provides a single interface for making predictions on new circuits.
     Supports feature selection and sequential prediction (threshold -> runtime).
+
+    Innovation 5: Optional curve predictor for family-aware safety net.
+    For high-threshold families, uses max(direct, curve) to avoid under-prediction.
+
+    Additional enhancements:
+    - Runtime curve predictor: predict runtime at each threshold rung
+    - Auxiliary predictor: predict sweep-derived features for enrichment
     """
 
     def __init__(
@@ -294,10 +301,14 @@ class CombinedPredictor:
         self.threshold_model = threshold_model or ThresholdModel()
         self.runtime_model = runtime_model or RuntimeModel()
         self.feature_columns: List[str] = []
+        self.enriched_feature_columns: List[str] = []  # After auxiliary enrichment
         self.selected_feature_names: List[str] = []
         self.selected_feature_names_threshold: List[str] = []
         self.selected_feature_names_runtime: List[str] = []
         self.feature_selector = None  # Optional FeatureSelector
+        self.curve_predictor = None  # Optional FidelityCurvePredictor (Innovation 5)
+        self.rt_curve_predictor = None  # Optional RuntimeCurvePredictor
+        self.aux_predictor = None  # Optional AuxiliaryFeaturePredictor
 
     def fit(
         self,
@@ -321,34 +332,60 @@ class CombinedPredictor:
         Predict threshold and runtime using sequential prediction.
 
         Steps:
-        1. Apply feature selection (if selector is set)
-        2. Predict thresholds
-        3. Apply family floors (if families provided)
-        4. Predict runtime using predicted thresholds
+        1. Enrich features with auxiliary predictions (if aux_predictor is set)
+        2. Apply feature selection (if selector is set)
+        3. Predict thresholds (direct model)
+        4. Apply curve predictor safety net for high-threshold families (Innovation 5)
+        5. Apply family floors (if families provided)
+        6. Predict runtime using predicted thresholds
+        7. Blend with runtime curve predictor (if available)
 
         Returns: (predicted_thresholds, predicted_times)
         """
+        # Step 0: Enrich features with auxiliary predictions if available
+        X_enriched = X
+        if self.aux_predictor is not None:
+            aux_features = self.aux_predictor.predict_as_features(X)
+            if aux_features.shape[1] > 0:
+                X_enriched = np.hstack([X, aux_features])
+
         # Apply feature selection if available
         if self.feature_selector is not None:
             if hasattr(self.feature_selector, "transform_threshold") and hasattr(self.feature_selector, "transform_runtime"):
-                X_thr = self.feature_selector.transform_threshold(X)
-                X_rt = self.feature_selector.transform_runtime(X)
+                X_thr = self.feature_selector.transform_threshold(X_enriched)
+                X_rt = self.feature_selector.transform_runtime(X_enriched)
             else:
-                X_thr = self.feature_selector.transform(X)
+                X_thr = self.feature_selector.transform(X_enriched)
                 X_rt = X_thr
         else:
-            X_thr = X
-            X_rt = X
+            X_thr = X_enriched
+            X_rt = X_enriched
 
-        # Step 1: Predict thresholds
+        # Step 1: Predict thresholds (direct model)
         thresholds = self.threshold_model.predict(X_thr)
 
-        # Step 2: Apply family floors if families provided
+        # Step 2: Apply curve predictor safety net (Innovation 5)
+        # For high-threshold families, use max(direct, curve) to avoid under-prediction
+        if self.curve_predictor is not None and families is not None:
+            # Curve predictor uses enriched features
+            curve_thresholds = self.curve_predictor.predict_threshold(X_enriched)
+            for i, family in enumerate(families):
+                if family in HIGH_THRESHOLD_FAMILIES:
+                    # For hard families, take the more conservative prediction
+                    thresholds[i] = max(thresholds[i], curve_thresholds[i])
+
+        # Step 3: Apply family floors if families provided
         if families is not None:
             thresholds = apply_family_floor(thresholds, families)
 
-        # Step 3: Predict runtime using predicted thresholds (sequential prediction)
+        # Step 4: Predict runtime using predicted thresholds (sequential prediction)
         times = self.runtime_model.predict(X_rt, thresholds)
+
+        # Step 5: Blend with runtime curve predictor if available
+        if self.rt_curve_predictor is not None:
+            curve_times = self.rt_curve_predictor.predict_runtime_at_threshold(X_enriched, thresholds)
+            # Geometric mean blending for runtime
+            times = np.sqrt(times * curve_times)
 
         return thresholds, times
 
@@ -360,10 +397,14 @@ class CombinedPredictor:
                 "threshold_model": self.threshold_model,
                 "runtime_model": self.runtime_model,
                 "feature_columns": self.feature_columns,
+                "enriched_feature_columns": self.enriched_feature_columns,
                 "selected_feature_names": self.selected_feature_names,
                 "selected_feature_names_threshold": self.selected_feature_names_threshold,
                 "selected_feature_names_runtime": self.selected_feature_names_runtime,
                 "feature_selector": self.feature_selector,
+                "curve_predictor": self.curve_predictor,
+                "rt_curve_predictor": self.rt_curve_predictor,
+                "aux_predictor": self.aux_predictor,
             }, f)
 
     @classmethod
@@ -378,6 +419,7 @@ class CombinedPredictor:
             runtime_model=data["runtime_model"],
         )
         predictor.feature_columns = data.get("feature_columns", [])
+        predictor.enriched_feature_columns = data.get("enriched_feature_columns", [])
         predictor.selected_feature_names = data.get("selected_feature_names", [])
         predictor.selected_feature_names_threshold = data.get(
             "selected_feature_names_threshold",
@@ -388,7 +430,18 @@ class CombinedPredictor:
             predictor.selected_feature_names,
         )
         predictor.feature_selector = data.get("feature_selector", None)
+        predictor.curve_predictor = data.get("curve_predictor", None)
+        predictor.rt_curve_predictor = data.get("rt_curve_predictor", None)
+        predictor.aux_predictor = data.get("aux_predictor", None)
         return predictor
+
+
+# Families that need curve-aware prediction (high threshold families)
+# For these families, we use max(direct, curve) to avoid under-prediction
+HIGH_THRESHOLD_FAMILIES = {
+    "TwoLocalRandom", "QNN", "Portfolio_QAOA", "Portfolio_VQE",
+    "Pricing_Call", "Ground_State", "Amplitude_Estimation", "Shor", "GraphState"
+}
 
 
 # Family-to-minimum-threshold mapping from training data analysis

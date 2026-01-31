@@ -1,4 +1,8 @@
-# Top 25 threshold features selected by correlation
+# Top 30 threshold features selected by correlation
+pred_rungs_to_099
+pred_biggest_jump_rung
+pred_fidelity_at_1
+pred_biggest_fid_jump
 param_n_unique
 param_entropy
 gate_density
@@ -24,3 +28,4 @@ n_qregs
 graph_std_degree
 n_parameterized_gates
 n_cbits
+n_qubits

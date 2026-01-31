@@ -37,6 +37,7 @@ from src.models import (
     get_feature_columns,
     apply_family_floor,
     FAMILY_THRESHOLD_FLOORS,
+    HIGH_THRESHOLD_FAMILIES,
 )
 from src.scoring import (
     compute_overall_score,
@@ -47,6 +48,9 @@ from src.scoring import (
     find_optimal_safety_margin,
 )
 from src.feature_selection import FeatureSelector
+from src.curve_predictor import FidelityCurvePredictor, extract_curve_targets
+from src.runtime_curve_predictor import RuntimeCurvePredictor, extract_runtime_curves
+from src.auxiliary_features import AuxiliaryFeaturePredictor, extract_auxiliary_targets, EnrichedFeatureBuilder
 
 # Paths
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -116,6 +120,9 @@ def leave_one_circuit_out_cv(
     safety_margin: float = 0.3,
     use_family_floor: bool = True,
     n_features: int = 30,
+    use_curve_predictor: bool = False,
+    use_runtime_curve: bool = False,
+    use_auxiliary_features: bool = False,
 ) -> dict:
     """
     Perform leave-one-circuit-out cross-validation.
@@ -126,9 +133,11 @@ def leave_one_circuit_out_cv(
     Key improvements:
     1. Feature selection fitted on training data only (prevents leakage)
     2. Sequential prediction: threshold first, then runtime uses predicted threshold
+    3. Innovation 5: Curve predictor safety net for high-threshold families
+    4. Runtime curve prediction: predict runtime at each threshold rung
+    5. Auxiliary feature enrichment: predict sweep-derived features
     """
     circuits = df["file"].unique()
-    n_circuits = len(circuits)
 
     all_pred_thresholds = []
     all_true_thresholds = []
@@ -136,6 +145,15 @@ def leave_one_circuit_out_cv(
     all_true_times = []
     all_indices = []
     all_families = []
+
+    # Extract curve targets if using curve predictor
+    curves = extract_curve_targets(df) if use_curve_predictor else None
+
+    # Extract runtime curves if using runtime curve predictor
+    runtime_curves = extract_runtime_curves(df) if use_runtime_curve else None
+
+    # Extract auxiliary targets if using auxiliary features
+    auxiliary_targets = extract_auxiliary_targets(df) if use_auxiliary_features else None
 
     for i, circuit in enumerate(circuits):
         # Split: leave out all rows for this circuit
@@ -151,21 +169,48 @@ def leave_one_circuit_out_cv(
         # Get predicted family for test circuit
         test_families = df.loc[test_mask, "predicted_family"].tolist()
 
+        # Optional: Enrich features with predicted auxiliary features
+        if use_auxiliary_features and auxiliary_targets is not None:
+            train_aux = {k: v[train_mask] for k, v in auxiliary_targets.items()}
+            aux_predictor = AuxiliaryFeaturePredictor(n_estimators=50, max_depth=3)
+            aux_predictor.fit(X_train, train_aux)
+            # Add predicted auxiliary features to both train and test
+            X_train_aux = aux_predictor.predict_as_features(X_train)
+            X_test_aux = aux_predictor.predict_as_features(X_test)
+            X_train_enriched = np.hstack([X_train, X_train_aux])
+            X_test_enriched = np.hstack([X_test, X_test_aux])
+            enriched_names = feature_names + [f"pred_{t}" for t in aux_predictor.models.keys()]
+        else:
+            X_train_enriched, X_test_enriched = X_train, X_test
+            enriched_names = feature_names
+
         # Step 1: Feature selection (fitted on training data only)
         selector = FeatureSelector(k=n_features)
-        selector.fit(X_train, y_thr_train, y_time_train, feature_names)
-        X_train_thr = selector.transform_threshold(X_train)
-        X_test_thr = selector.transform_threshold(X_test)
-        X_train_rt = selector.transform_runtime(X_train)
-        X_test_rt = selector.transform_runtime(X_test)
+        selector.fit(X_train_enriched, y_thr_train, y_time_train, enriched_names)
+        X_train_thr = selector.transform_threshold(X_train_enriched)
+        X_test_thr = selector.transform_threshold(X_test_enriched)
+        X_train_rt = selector.transform_runtime(X_train_enriched)
+        X_test_rt = selector.transform_runtime(X_test_enriched)
 
         # Step 2: Train threshold model on selected features
         thr_model = ThresholdModel(**threshold_params, safety_margin=safety_margin)
         thr_model.fit(X_train_thr, y_thr_train, calibrate=False)
         thr_model.safety_margin = safety_margin
 
-        # Step 3: Predict thresholds (needed before runtime prediction)
+        # Step 3: Predict thresholds (direct model)
         pred_thresholds = thr_model.predict(X_test_thr)
+
+        # Step 3b: Innovation 5 - Curve predictor safety net for high-threshold families
+        if use_curve_predictor and curves is not None:
+            train_curves = {rung: curves[rung][train_mask] for rung in curves}
+            curve_model = FidelityCurvePredictor(mode='multi_output', n_estimators=100, max_depth=4)
+            curve_model.fit(X_train, train_curves)
+            curve_pred = curve_model.predict_threshold(X_test)
+
+            # For high-threshold families, take max(direct, curve)
+            for j, family in enumerate(test_families):
+                if family in HIGH_THRESHOLD_FAMILIES:
+                    pred_thresholds[j] = max(pred_thresholds[j], curve_pred[j])
 
         # Apply family floor (Innovation #3)
         if use_family_floor:
@@ -180,6 +225,15 @@ def leave_one_circuit_out_cv(
 
         # Step 5: Predict runtime using PREDICTED thresholds (sequential prediction)
         pred_times = rt_model.predict(X_test_rt, pred_thresholds)
+
+        # Step 5b: Optional runtime curve prediction for better estimates
+        if use_runtime_curve and runtime_curves is not None:
+            train_rt_curves = {rung: runtime_curves[rung][train_mask] for rung in runtime_curves}
+            rt_curve_model = RuntimeCurvePredictor(n_estimators=100, max_depth=4)
+            rt_curve_model.fit(X_train_enriched, train_rt_curves)
+            curve_pred_times = rt_curve_model.predict_runtime_at_threshold(X_test_enriched, pred_thresholds)
+            # Blend direct and curve predictions (geometric mean for runtime)
+            pred_times = np.sqrt(pred_times * curve_pred_times)
 
         # Collect results
         for j, (pt, tt, ptr, ttr, fam) in enumerate(zip(
@@ -293,10 +347,80 @@ def tune_hyperparameters(
             best_n_features = n_feat
         total_evals += 1
 
+    # Innovation 5: Test curve predictor safety net
+    print(f"\n  Testing curve predictor safety net (Innovation 5):")
+    best_use_curve = False
+    for use_curve in [False, True]:
+        result = leave_one_circuit_out_cv(
+            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
+            use_curve_predictor=use_curve
+        )
+        score = result["scores"]["overall_score"]
+        thr_score = result["scores"]["mean_threshold_score"]
+        rt_score = result["scores"]["mean_runtime_score"]
+        n_fail = result["scores"]["n_threshold_failures"]
+        label = "WITH curve predictor" if use_curve else "WITHOUT curve predictor"
+        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
+        if score > best_score:
+            best_score = score
+            best_use_curve = use_curve
+        # Prefer curve predictor if similar score but fewer failures
+        elif abs(score - best_score) < 0.02 and use_curve and n_fail < result["scores"]["n_threshold_failures"]:
+            best_use_curve = True
+        total_evals += 1
+
+    # Test runtime curve predictor
+    print(f"\n  Testing runtime curve predictor:")
+    best_use_runtime_curve = False
+    for use_rt_curve in [False, True]:
+        result = leave_one_circuit_out_cv(
+            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
+            use_curve_predictor=best_use_curve, use_runtime_curve=use_rt_curve
+        )
+        score = result["scores"]["overall_score"]
+        thr_score = result["scores"]["mean_threshold_score"]
+        rt_score = result["scores"]["mean_runtime_score"]
+        n_fail = result["scores"]["n_threshold_failures"]
+        label = "WITH runtime curve" if use_rt_curve else "WITHOUT runtime curve"
+        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
+        if score > best_score:
+            best_score = score
+            best_use_runtime_curve = use_rt_curve
+        total_evals += 1
+
+    # Test auxiliary feature enrichment
+    print(f"\n  Testing auxiliary feature enrichment:")
+    best_use_aux = False
+    for use_aux in [False, True]:
+        result = leave_one_circuit_out_cv(
+            df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
+            feature_names, base_thr_params, base_rt_params,
+            safety_margin=best_margin, use_family_floor=True, n_features=best_n_features,
+            use_curve_predictor=best_use_curve, use_runtime_curve=best_use_runtime_curve,
+            use_auxiliary_features=use_aux
+        )
+        score = result["scores"]["overall_score"]
+        thr_score = result["scores"]["mean_threshold_score"]
+        rt_score = result["scores"]["mean_runtime_score"]
+        n_fail = result["scores"]["n_threshold_failures"]
+        label = "WITH aux features" if use_aux else "WITHOUT aux features"
+        print(f"    {label}: score={score:.4f} (thr={thr_score:.3f}, rt={rt_score:.3f}, failures={n_fail})")
+        if score > best_score:
+            best_score = score
+            best_use_aux = use_aux
+        total_evals += 1
+
     print(f"\n  Best configuration:")
     print(f"    Safety margin: {best_margin}")
     print(f"    Use family floors: {best_use_family}")
     print(f"    Number of features: {best_n_features}")
+    print(f"    Use curve predictor: {best_use_curve}")
+    print(f"    Use runtime curve: {best_use_runtime_curve}")
+    print(f"    Use auxiliary features: {best_use_aux}")
     print(f"    Best overall score: {best_score:.4f}")
     print(f"  Total evaluations: {total_evals}")
 
@@ -306,6 +430,9 @@ def tune_hyperparameters(
         "safety_margin": best_margin,
         "use_family_floor": best_use_family,
         "n_features": best_n_features,
+        "use_curve_predictor": best_use_curve,
+        "use_runtime_curve": best_use_runtime_curve,
+        "use_auxiliary_features": best_use_aux,
         "best_score": best_score,
     }
 
@@ -408,6 +535,9 @@ def main():
         best_params["safety_margin"],
         best_params.get("use_family_floor", True),
         best_params.get("n_features", 30),
+        best_params.get("use_curve_predictor", False),
+        best_params.get("use_runtime_curve", False),
+        best_params.get("use_auxiliary_features", False),
     )
 
     analyze_cv_results(final_cv, df)
@@ -415,37 +545,81 @@ def main():
     # ── Step 5: Train final models ─────────────────────────────────────
     print("\n[5/5] Training final models on full data...")
 
-    # Step 5a: Feature selection on full data
+    # Step 5a: Optional auxiliary feature enrichment
     n_features = best_params.get("n_features", 30)
+    X_enriched = X.copy()
+    enriched_feature_cols = feature_cols.copy()
+    final_aux_predictor = None
+
+    if best_params.get("use_auxiliary_features", False):
+        print("  Training auxiliary feature predictor...")
+        auxiliary_targets = extract_auxiliary_targets(df)
+        final_aux_predictor = AuxiliaryFeaturePredictor(n_estimators=50, max_depth=3)
+        final_aux_predictor.fit(X, auxiliary_targets)
+        X_aux = final_aux_predictor.predict_as_features(X)
+        X_enriched = np.hstack([X, X_aux])
+        enriched_feature_cols = feature_cols + [f"pred_{t}" for t in final_aux_predictor.models.keys()]
+        print(f"  Added {X_aux.shape[1]} predicted auxiliary features")
+
+    # Step 5b: Feature selection on (possibly enriched) data
     final_selector = FeatureSelector(k=n_features)
-    final_selector.fit(X, y_threshold, y_total_time, feature_cols)
-    X_selected_thr = final_selector.transform_threshold(X)
-    X_selected_rt = final_selector.transform_runtime(X)
+    final_selector.fit(X_enriched, y_threshold, y_total_time, enriched_feature_cols)
+    X_selected_thr = final_selector.transform_threshold(X_enriched)
+    X_selected_rt = final_selector.transform_runtime(X_enriched)
     selected_feature_names_thr = final_selector.get_selected_names(target="threshold")
     selected_feature_names_rt = final_selector.get_selected_names(target="runtime")
-    print(f"  Selected {n_features} threshold features from {len(feature_cols)}")
-    print(f"  Selected {n_features} runtime features from {len(feature_cols)}")
+    print(f"  Selected {n_features} threshold features from {len(enriched_feature_cols)}")
+    print(f"  Selected {n_features} runtime features from {len(enriched_feature_cols)}")
 
-    # Step 5b: Threshold model on selected features
+    # Step 5c: Threshold model on selected features
     final_thr_model = ThresholdModel(
         **best_params["threshold_params"],
         safety_margin=best_params["safety_margin"]
     )
     final_thr_model.fit(X_selected_thr, y_threshold, calibrate=False)
 
-    # Step 5c: Runtime model on selected features + thresholds
+    # Step 5d: Runtime model on selected features + thresholds
     final_rt_model = RuntimeModel(**best_params["runtime_params"])
     final_rt_model.fit(
         X_selected_rt, y_total_time, y_threshold,  # Use true thresholds for final training
         y_setup_time, y_per_shot_time
     )
 
+    # Step 5e: Optional runtime curve predictor
+    final_rt_curve_predictor = None
+    if best_params.get("use_runtime_curve", False):
+        print("  Training runtime curve predictor...")
+        runtime_curves = extract_runtime_curves(df)
+        final_rt_curve_predictor = RuntimeCurvePredictor(n_estimators=100, max_depth=4)
+        final_rt_curve_predictor.fit(X_enriched, runtime_curves)
+        print(f"  Runtime curve predictor trained on {len(runtime_curves)} rungs")
+
     # Combined predictor with selector
     combined = CombinedPredictor(final_thr_model, final_rt_model)
     combined.feature_columns = feature_cols  # Original feature columns
+    combined.enriched_feature_columns = enriched_feature_cols  # Enriched columns (may include aux)
     combined.selected_feature_names_threshold = selected_feature_names_thr
     combined.selected_feature_names_runtime = selected_feature_names_rt
     combined.feature_selector = final_selector  # Store selector for prediction
+
+    # Store auxiliary predictor if enabled
+    if final_aux_predictor is not None:
+        combined.aux_predictor = final_aux_predictor
+        print("  Auxiliary predictor stored in model")
+
+    # Store runtime curve predictor if enabled
+    if final_rt_curve_predictor is not None:
+        combined.rt_curve_predictor = final_rt_curve_predictor
+        print("  Runtime curve predictor stored in model")
+
+    # Step 5f: Train fidelity curve predictor if enabled (Innovation 5)
+    if best_params.get("use_curve_predictor", False):
+        print("  Training fidelity curve predictor (Innovation 5)...")
+        curves = extract_curve_targets(df)
+        final_curve_predictor = FidelityCurvePredictor(mode='multi_output', n_estimators=100, max_depth=4)
+        final_curve_predictor.fit(X_enriched, curves)
+        combined.curve_predictor = final_curve_predictor
+        print("  Fidelity curve predictor trained successfully")
 
     # Save models
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -468,6 +642,11 @@ def main():
         f.write(f"\nFeature Selection:\n")
         f.write(f"  n_features: {n_features}\n")
         f.write(f"  from original: {len(feature_cols)}\n")
+        f.write(f"  enriched features: {len(enriched_feature_cols)}\n")
+        f.write(f"\nEnhancements:\n")
+        f.write(f"  use_curve_predictor (fidelity): {best_params.get('use_curve_predictor', False)}\n")
+        f.write(f"  use_runtime_curve: {best_params.get('use_runtime_curve', False)}\n")
+        f.write(f"  use_auxiliary_features: {best_params.get('use_auxiliary_features', False)}\n")
         f.write(f"\nCV Score: {best_params['best_score']:.4f}\n")
     print(f"  Saved parameters to: {params_path}")
 

@@ -1,4 +1,4 @@
-# Top 25 runtime features selected by correlation
+# Top 30 runtime features selected by correlation
 graph_max_degree
 graph_bandwidth_heuristic
 graph_bandwidth_min
@@ -12,8 +12,8 @@ n_cbits
 cut_pressure_entropy
 n_active_cuts
 n_qubits
-graph_min_balanced_separator
 graph_mean_degree
+graph_min_balanced_separator
 graph_p75_degree
 graph_degeneracy
 graph_treewidth_min_degree
@@ -24,3 +24,8 @@ graph_min_degree
 gate_swap_count
 graph_cutwidth_min
 graph_cutwidth_heuristic
+edge_cutwidth_natural
+graph_cutwidth_natural
+graph_n_edges
+graph_recursive_bisection_max_cut
+graph_degree_entropy
