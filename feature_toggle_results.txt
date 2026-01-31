@@ -1,0 +1,4 @@
+exp=True, mps=True -> Overall 0.4384, Mean threshold 0.7464, Mean runtime 0.5590
+exp=True, mps=False -> Overall 0.4279, Mean threshold 0.7464, Mean runtime 0.5494
+exp=False, mps=True -> Overall 0.4405, Mean threshold 0.7755, Mean runtime 0.5480
+exp=False, mps=False -> Overall 0.4327, Mean threshold 0.7755, Mean runtime 0.5430
