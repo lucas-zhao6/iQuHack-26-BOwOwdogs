@@ -154,16 +154,18 @@ def leave_one_circuit_out_cv(
         # Step 1: Feature selection (fitted on training data only)
         selector = FeatureSelector(k=n_features)
         selector.fit(X_train, y_thr_train, y_time_train, feature_names)
-        X_train_sel = selector.transform(X_train)
-        X_test_sel = selector.transform(X_test)
+        X_train_thr = selector.transform_threshold(X_train)
+        X_test_thr = selector.transform_threshold(X_test)
+        X_train_rt = selector.transform_runtime(X_train)
+        X_test_rt = selector.transform_runtime(X_test)
 
         # Step 2: Train threshold model on selected features
         thr_model = ThresholdModel(**threshold_params, safety_margin=safety_margin)
-        thr_model.fit(X_train_sel, y_thr_train, calibrate=False)
+        thr_model.fit(X_train_thr, y_thr_train, calibrate=False)
         thr_model.safety_margin = safety_margin
 
         # Step 3: Predict thresholds (needed before runtime prediction)
-        pred_thresholds = thr_model.predict(X_test_sel)
+        pred_thresholds = thr_model.predict(X_test_thr)
 
         # Apply family floor (Innovation #3)
         if use_family_floor:
@@ -172,12 +174,12 @@ def leave_one_circuit_out_cv(
         # Step 4: Train runtime model with TRUE thresholds from training data
         rt_model = RuntimeModel(**runtime_params)
         rt_model.fit(
-            X_train_sel, y_time_train, y_thr_train,  # Use true thresholds for training
+            X_train_rt, y_time_train, y_thr_train,  # Use true thresholds for training
             y_setup_train, y_per_shot_train
         )
 
         # Step 5: Predict runtime using PREDICTED thresholds (sequential prediction)
-        pred_times = rt_model.predict(X_test_sel, pred_thresholds)
+        pred_times = rt_model.predict(X_test_rt, pred_thresholds)
 
         # Collect results
         for j, (pt, tt, ptr, ttr, fam) in enumerate(zip(
@@ -417,28 +419,32 @@ def main():
     n_features = best_params.get("n_features", 30)
     final_selector = FeatureSelector(k=n_features)
     final_selector.fit(X, y_threshold, y_total_time, feature_cols)
-    X_selected = final_selector.transform(X)
-    selected_feature_names = final_selector.get_selected_names()
-    print(f"  Selected {n_features} features from {len(feature_cols)}")
+    X_selected_thr = final_selector.transform_threshold(X)
+    X_selected_rt = final_selector.transform_runtime(X)
+    selected_feature_names_thr = final_selector.get_selected_names(target="threshold")
+    selected_feature_names_rt = final_selector.get_selected_names(target="runtime")
+    print(f"  Selected {n_features} threshold features from {len(feature_cols)}")
+    print(f"  Selected {n_features} runtime features from {len(feature_cols)}")
 
     # Step 5b: Threshold model on selected features
     final_thr_model = ThresholdModel(
         **best_params["threshold_params"],
         safety_margin=best_params["safety_margin"]
     )
-    final_thr_model.fit(X_selected, y_threshold, calibrate=False)
+    final_thr_model.fit(X_selected_thr, y_threshold, calibrate=False)
 
     # Step 5c: Runtime model on selected features + thresholds
     final_rt_model = RuntimeModel(**best_params["runtime_params"])
     final_rt_model.fit(
-        X_selected, y_total_time, y_threshold,  # Use true thresholds for final training
+        X_selected_rt, y_total_time, y_threshold,  # Use true thresholds for final training
         y_setup_time, y_per_shot_time
     )
 
     # Combined predictor with selector
     combined = CombinedPredictor(final_thr_model, final_rt_model)
     combined.feature_columns = feature_cols  # Original feature columns
-    combined.selected_feature_names = selected_feature_names  # Selected features
+    combined.selected_feature_names_threshold = selected_feature_names_thr
+    combined.selected_feature_names_runtime = selected_feature_names_rt
     combined.feature_selector = final_selector  # Store selector for prediction
 
     # Save models
@@ -473,12 +479,19 @@ def main():
     print(f"  Saved feature columns to: {feature_path}")
 
     # Save selected features
-    selected_path = OUTPUT_DIR / "selected_features.txt"
-    with open(selected_path, "w") as f:
-        f.write(f"# Top {n_features} features selected by correlation with targets\n")
-        for col in selected_feature_names:
+    selected_thr_path = OUTPUT_DIR / "selected_features_threshold.txt"
+    with open(selected_thr_path, "w") as f:
+        f.write(f"# Top {n_features} threshold features selected by correlation\n")
+        for col in selected_feature_names_thr:
             f.write(col + "\n")
-    print(f"  Saved selected features to: {selected_path}")
+    print(f"  Saved threshold features to: {selected_thr_path}")
+
+    selected_rt_path = OUTPUT_DIR / "selected_features_runtime.txt"
+    with open(selected_rt_path, "w") as f:
+        f.write(f"# Top {n_features} runtime features selected by correlation\n")
+        for col in selected_feature_names_rt:
+            f.write(col + "\n")
+    print(f"  Saved runtime features to: {selected_rt_path}")
 
     # ── Summary ────────────────────────────────────────────────────────
     total_time = time.time() - start_time

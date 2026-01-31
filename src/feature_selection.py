@@ -80,18 +80,7 @@ def select_features_combined(
 
     Uses a combined score: max(corr_threshold, corr_runtime) to ensure
     features useful for either task are included.
-
-    Args:
-        X: Feature matrix
-        y_threshold: Threshold target (log2 scale recommended)
-        y_runtime: Runtime target (log scale recommended)
-        feature_names: Feature names
-        k: Number of features to select
-
-    Returns:
-        selected_indices, selected_names
     """
-    # Get correlations for both targets
     _, _, corr_thr = select_features_by_correlation(
         X, y_threshold, feature_names, k=len(feature_names)
     )
@@ -99,31 +88,58 @@ def select_features_combined(
         X, y_runtime, feature_names, k=len(feature_names)
     )
 
-    # Combined score: max of the two correlations
-    combined_scores = {}
-    for name in feature_names:
-        combined_scores[name] = max(
-            corr_thr.get(name, 0.0),
-            corr_rt.get(name, 0.0)
-        )
-
-    # Sort and select
+    combined_scores = {
+        name: max(corr_thr.get(name, 0.0), corr_rt.get(name, 0.0))
+        for name in feature_names
+    }
     sorted_features = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
     selected_names = [f[0] for f in sorted_features[:k]]
     selected_indices = [feature_names.index(name) for name in selected_names]
-
     return selected_indices, selected_names
+
+
+def select_features_split(
+    X: np.ndarray,
+    y_threshold: np.ndarray,
+    y_runtime: np.ndarray,
+    feature_names: List[str],
+    k_threshold: int = 30,
+    k_runtime: int = 30,
+) -> Tuple[List[int], List[str], List[int], List[str]]:
+    """
+    Select separate feature sets for threshold and runtime prediction.
+    """
+    _, _, corr_thr = select_features_by_correlation(
+        X, y_threshold, feature_names, k=len(feature_names)
+    )
+    _, _, corr_rt = select_features_by_correlation(
+        X, y_runtime, feature_names, k=len(feature_names)
+    )
+
+    thr_sorted = sorted(corr_thr.items(), key=lambda x: x[1], reverse=True)
+    rt_sorted = sorted(corr_rt.items(), key=lambda x: x[1], reverse=True)
+
+    thr_names = [f[0] for f in thr_sorted[:k_threshold]]
+    rt_names = [f[0] for f in rt_sorted[:k_runtime]]
+    thr_indices = [feature_names.index(name) for name in thr_names]
+    rt_indices = [feature_names.index(name) for name in rt_names]
+    return thr_indices, thr_names, rt_indices, rt_names
 
 
 class FeatureSelector:
     """
     Feature selector that can be fitted and applied consistently.
+
+    Supports split selection (different feature sets for threshold vs runtime).
     """
 
-    def __init__(self, k: int = 30):
-        self.k = k
-        self.selected_indices: List[int] = []
-        self.selected_names: List[str] = []
+    def __init__(self, k: int = 30, k_threshold: int | None = None, k_runtime: int | None = None):
+        self.k_threshold = k_threshold if k_threshold is not None else k
+        self.k_runtime = k_runtime if k_runtime is not None else k
+        self.selected_indices_threshold: List[int] = []
+        self.selected_names_threshold: List[str] = []
+        self.selected_indices_runtime: List[int] = []
+        self.selected_names_runtime: List[str] = []
         self.all_feature_names: List[str] = []
         self._fitted = False
 
@@ -141,16 +157,36 @@ class FeatureSelector:
         y_thr_log = np.log2(np.clip(y_threshold, 1, 512))
         y_rt_log = np.log1p(y_runtime)
 
-        self.selected_indices, self.selected_names = select_features_combined(
-            X, y_thr_log, y_rt_log, feature_names, self.k
+        (
+            self.selected_indices_threshold,
+            self.selected_names_threshold,
+            self.selected_indices_runtime,
+            self.selected_names_runtime,
+        ) = select_features_split(
+            X, y_thr_log, y_rt_log, feature_names,
+            k_threshold=self.k_threshold, k_runtime=self.k_runtime,
         )
         self._fitted = True
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """Apply feature selection."""
+    def transform_threshold(self, X: np.ndarray) -> np.ndarray:
+        """Apply threshold feature selection."""
         if not self._fitted:
             raise RuntimeError("FeatureSelector not fitted")
-        return X[:, self.selected_indices]
+        return X[:, self.selected_indices_threshold]
+
+    def transform_runtime(self, X: np.ndarray) -> np.ndarray:
+        """Apply runtime feature selection."""
+        if not self._fitted:
+            raise RuntimeError("FeatureSelector not fitted")
+        return X[:, self.selected_indices_runtime]
+
+    def transform(self, X: np.ndarray, target: str = "threshold") -> np.ndarray:
+        """Apply feature selection for a specific target."""
+        if target == "threshold":
+            return self.transform_threshold(X)
+        if target == "runtime":
+            return self.transform_runtime(X)
+        raise ValueError(f"Unknown target: {target}")
 
     def fit_transform(
         self,
@@ -159,10 +195,14 @@ class FeatureSelector:
         y_runtime: np.ndarray,
         feature_names: List[str],
     ) -> np.ndarray:
-        """Fit and transform in one step."""
+        """Fit and transform in one step (threshold selection)."""
         self.fit(X, y_threshold, y_runtime, feature_names)
-        return self.transform(X)
+        return self.transform_threshold(X)
 
-    def get_selected_names(self) -> List[str]:
-        """Return names of selected features."""
-        return self.selected_names.copy()
+    def get_selected_names(self, target: str = "threshold") -> List[str]:
+        """Return names of selected features for a specific target."""
+        if target == "threshold":
+            return self.selected_names_threshold.copy()
+        if target == "runtime":
+            return self.selected_names_runtime.copy()
+        raise ValueError(f"Unknown target: {target}")

@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.feature_pipeline import build_full_training_dataframe
 from src.family_classifier import FamilyClassifierKNN
+from src.feature_selection import FeatureSelector
 
 # Paths
 CIRCUITS_DIR = PROJECT_ROOT / "2026-Quantum-Rings" / "circuits"
@@ -145,6 +146,28 @@ def main():
         print("\n  Top 15 features correlated with log(runtime) (|r|):")
         for feat, corr in rt_corr.head(15).items():
             print(f"    {corr:.3f}  {feat}")
+
+    # FeatureSelector preview (matches Phase 2 selection logic)
+    print("\n  FeatureSelector (split threshold/runtime) selection:")
+    valid_mask = df["selected_threshold"].notna() & df["forward_wall_s"].notna()
+    fs_df = df[valid_mask].copy()
+    X_fs = fs_df[feature_cols].copy()
+    X_fs = X_fs.fillna(X_fs.mean())
+    y_thr_fs = fs_df["selected_threshold"].values.astype(float)
+    y_rt_fs = fs_df["forward_wall_s"].values.astype(float)
+
+    selector = FeatureSelector(k=30)
+    selector.fit(X_fs.values, y_thr_fs, y_rt_fs, feature_cols)
+    selected_thr = selector.get_selected_names(target="threshold")
+    selected_rt = selector.get_selected_names(target="runtime")
+
+    print("    Threshold features:")
+    for i, name in enumerate(selected_thr, 1):
+        print(f"      {i:3d}. {name}")
+
+    print("    Runtime features:")
+    for i, name in enumerate(selected_rt, 1):
+        print(f"      {i:3d}. {name}")
 
     # ── Step 5: Per-family threshold summary ───────────────────────────
     print("\n[5/5] Per-family threshold distribution...")

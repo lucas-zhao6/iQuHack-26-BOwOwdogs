@@ -295,6 +295,8 @@ class CombinedPredictor:
         self.runtime_model = runtime_model or RuntimeModel()
         self.feature_columns: List[str] = []
         self.selected_feature_names: List[str] = []
+        self.selected_feature_names_threshold: List[str] = []
+        self.selected_feature_names_runtime: List[str] = []
         self.feature_selector = None  # Optional FeatureSelector
 
     def fit(
@@ -328,17 +330,25 @@ class CombinedPredictor:
         """
         # Apply feature selection if available
         if self.feature_selector is not None:
-            X = self.feature_selector.transform(X)
+            if hasattr(self.feature_selector, "transform_threshold") and hasattr(self.feature_selector, "transform_runtime"):
+                X_thr = self.feature_selector.transform_threshold(X)
+                X_rt = self.feature_selector.transform_runtime(X)
+            else:
+                X_thr = self.feature_selector.transform(X)
+                X_rt = X_thr
+        else:
+            X_thr = X
+            X_rt = X
 
         # Step 1: Predict thresholds
-        thresholds = self.threshold_model.predict(X)
+        thresholds = self.threshold_model.predict(X_thr)
 
         # Step 2: Apply family floors if families provided
         if families is not None:
             thresholds = apply_family_floor(thresholds, families)
 
         # Step 3: Predict runtime using predicted thresholds (sequential prediction)
-        times = self.runtime_model.predict(X, thresholds)
+        times = self.runtime_model.predict(X_rt, thresholds)
 
         return thresholds, times
 
@@ -351,6 +361,8 @@ class CombinedPredictor:
                 "runtime_model": self.runtime_model,
                 "feature_columns": self.feature_columns,
                 "selected_feature_names": self.selected_feature_names,
+                "selected_feature_names_threshold": self.selected_feature_names_threshold,
+                "selected_feature_names_runtime": self.selected_feature_names_runtime,
                 "feature_selector": self.feature_selector,
             }, f)
 
@@ -367,6 +379,14 @@ class CombinedPredictor:
         )
         predictor.feature_columns = data.get("feature_columns", [])
         predictor.selected_feature_names = data.get("selected_feature_names", [])
+        predictor.selected_feature_names_threshold = data.get(
+            "selected_feature_names_threshold",
+            predictor.selected_feature_names,
+        )
+        predictor.selected_feature_names_runtime = data.get(
+            "selected_feature_names_runtime",
+            predictor.selected_feature_names,
+        )
         predictor.feature_selector = data.get("feature_selector", None)
         return predictor
 

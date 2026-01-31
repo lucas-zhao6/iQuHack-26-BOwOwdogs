@@ -16,7 +16,7 @@ Runtime Model:
   min_samples_leaf: 3
 
 Feature Selection:
-  n_features: 20
+  n_features: 25
   from original: 99
 
-CV Score: 0.3766
+CV Score: 0.4074
