@@ -440,6 +440,22 @@ def compute_gate_type_fingerprint(circuit: ParsedCircuit) -> Dict[str, float]:
     features["n_distinct_gate_types"] = float(len(gate_counter))
     features["total_gates"] = float(total)
 
+    # Clifford vs non-Clifford ratios (approximate)
+    clifford_1q = {"h", "x", "y", "z", "s", "sdg", "sx", "sxdg"}
+    clifford_2q = {"cx", "cz", "swap", "iswap"} if "iswap" in gate_counter else {"cx", "cz", "swap"}
+    nonclifford_1q = {"t", "tdg", "p", "rx", "ry", "rz", "u", "u1", "u2", "u3"}
+    nonclifford_2q = {"cp", "rzz", "rxx", "cu", "cu1", "cu3", "crx", "cry", "crz", "ch"}
+
+    n_clifford = sum(gate_counter.get(g, 0) for g in clifford_1q.union(clifford_2q))
+    n_nonclifford = sum(
+        gate_counter.get(g, 0) for g in nonclifford_1q.union(nonclifford_2q)
+    )
+    features["n_clifford_gates"] = float(n_clifford)
+    features["n_nonclifford_gates"] = float(n_nonclifford)
+    features["frac_clifford"] = n_clifford / total
+    features["frac_nonclifford"] = n_nonclifford / total
+    features["clifford_to_nonclifford_ratio"] = n_clifford / max(n_nonclifford, 1)
+
     return features
 
 
@@ -464,10 +480,16 @@ def compute_param_stats(circuit: ParsedCircuit) -> Dict[str, float]:
             "param_max": 0.0,
             "param_n_unique": 0.0,
             "param_entropy": 0.0,
+            "param_unique_ratio": 0.0,
+            "param_reuse_rate": 0.0,
+            "param_mode_frac": 0.0,
+            "param_top3_frac": 0.0,
         }
 
     arr = np.array(all_params)
-    n_unique = len(set(round(p, 8) for p in all_params))
+    rounded = [round(p, 8) for p in all_params]
+    n_unique = len(set(rounded))
+    total = len(rounded)
 
     # Entropy of binned parameter distribution
     hist, _ = np.histogram(arr, bins=min(20, max(n_unique, 2)))
@@ -478,6 +500,13 @@ def compute_param_stats(circuit: ParsedCircuit) -> Dict[str, float]:
     else:
         entropy = 0.0
 
+    counts = Counter(rounded)
+    freq = sorted(counts.values(), reverse=True)
+    mode_frac = freq[0] / total if freq else 0.0
+    top3_frac = sum(freq[:3]) / total if freq else 0.0
+    unique_ratio = n_unique / max(total, 1)
+    reuse_rate = 1.0 - unique_ratio
+
     return {
         "param_mean": float(arr.mean()),
         "param_std": float(arr.std()),
@@ -485,4 +514,8 @@ def compute_param_stats(circuit: ParsedCircuit) -> Dict[str, float]:
         "param_max": float(arr.max()),
         "param_n_unique": float(n_unique),
         "param_entropy": entropy,
+        "param_unique_ratio": float(unique_ratio),
+        "param_reuse_rate": float(reuse_rate),
+        "param_mode_frac": float(mode_frac),
+        "param_top3_frac": float(top3_frac),
     }

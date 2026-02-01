@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import optuna
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -226,6 +227,16 @@ def tune_hyperparameters(
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=max(5, n_splits))
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     study.optimize(objective, n_trials=n_trials)
+
+    try:
+        fig = optuna.visualization.matplotlib.plot_optimization_history(study)
+        fig.tight_layout()
+        plot_path = MODEL_DIR / "optuna_history.png"
+        fig.savefig(plot_path, dpi=160)
+        plt.close(fig)
+        print(f"  Saved Optuna optimization history: {plot_path}")
+    except Exception as exc:
+        print(f"  WARNING: failed to save Optuna history plot ({exc}).")
 
     best_params = study.best_trial.params
     best_thr_params = {k.replace("thr_", ""): v for k, v in best_params.items() if k.startswith("thr_")}

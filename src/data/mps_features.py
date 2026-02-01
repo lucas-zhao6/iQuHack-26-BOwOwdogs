@@ -168,6 +168,20 @@ def compute_gate_span_features(circuit: ParsedCircuit) -> Dict[str, float]:
 
     spans = [abs(q_i - q_j) for q_i, q_j in edges]
     spans_arr = np.array(spans, dtype=np.float64)
+    n = max(circuit.total_qubits, 1)
+    spans_norm = spans_arr / max(n - 1, 1)
+    if spans_arr.size > 0:
+        span_p25 = float(np.quantile(spans_arr, 0.25))
+        span_p50 = float(np.quantile(spans_arr, 0.50))
+        span_p75 = float(np.quantile(spans_arr, 0.75))
+        span_p90 = float(np.quantile(spans_arr, 0.90))
+        span_p25_norm = float(np.quantile(spans_norm, 0.25))
+        span_p50_norm = float(np.quantile(spans_norm, 0.50))
+        span_p75_norm = float(np.quantile(spans_norm, 0.75))
+        span_p90_norm = float(np.quantile(spans_norm, 0.90))
+    else:
+        span_p25 = span_p50 = span_p75 = span_p90 = 0.0
+        span_p25_norm = span_p50_norm = span_p75_norm = span_p90_norm = 0.0
 
     nn_count = sum(1 for s in spans if s == 1)
 
@@ -175,8 +189,21 @@ def compute_gate_span_features(circuit: ParsedCircuit) -> Dict[str, float]:
         "max_gate_span": float(spans_arr.max()),
         "mean_gate_span": float(spans_arr.mean()),
         "std_gate_span": float(spans_arr.std()),
+        "span_p25": span_p25,
+        "span_p50": span_p50,
+        "span_p75": span_p75,
+        "span_p90": span_p90,
+        "mean_gate_span_norm": float(spans_norm.mean()),
+        "std_gate_span_norm": float(spans_norm.std()),
+        "span_q90_norm": float(np.quantile(spans_norm, 0.9)),
+        "span_p25_norm": span_p25_norm,
+        "span_p50_norm": span_p50_norm,
+        "span_p75_norm": span_p75_norm,
+        "span_p90_norm": span_p90_norm,
         "frac_nearest_neighbor": nn_count / len(spans),
         "frac_long_range": sum(1 for s in spans if s > circuit.total_qubits // 4) / len(spans),
+        "connectivity_strain": float((spans_arr ** 2).mean()),
+        "connectivity_strain_norm": float((spans_norm ** 2).mean()),
     }
 
 
@@ -191,6 +218,11 @@ def compute_depth_features(circuit: ParsedCircuit) -> Dict[str, float]:
     qubit_time = [0] * n  # next available time for each qubit
 
     depths = []
+    layer_gate_counts: Dict[int, int] = {}
+    layer_active_qubits: Dict[int, set[int]] = {}
+    layer_2q_counts: Dict[int, int] = {}
+    layer_3q_counts: Dict[int, int] = {}
+
     for gate, gidx in zip(circuit.gates, circuit.gate_global_indices):
         if not gidx:
             continue
@@ -202,12 +234,59 @@ def compute_depth_features(circuit: ParsedCircuit) -> Dict[str, float]:
                 qubit_time[q] = end
         depths.append(end)
 
+        layer_idx = end - 1
+        layer_gate_counts[layer_idx] = layer_gate_counts.get(layer_idx, 0) + 1
+        if layer_idx not in layer_active_qubits:
+            layer_active_qubits[layer_idx] = set()
+        layer_active_qubits[layer_idx].update(q for q in gidx if q < n)
+
+        if gate.name in TWO_QUBIT_GATES:
+            layer_2q_counts[layer_idx] = layer_2q_counts.get(layer_idx, 0) + 1
+        elif gate.name in THREE_QUBIT_GATES:
+            layer_3q_counts[layer_idx] = layer_3q_counts.get(layer_idx, 0) + 1
+
     total_depth = max(qubit_time) if qubit_time else 0
+
+    total_gates = len(circuit.gates)
+    if total_depth > 0:
+        layer_counts = np.array(
+            [layer_gate_counts.get(i, 0) for i in range(total_depth)], dtype=np.float64
+        )
+        active_counts = np.array(
+            [len(layer_active_qubits.get(i, set())) for i in range(total_depth)],
+            dtype=np.float64,
+        )
+        layer_2q = np.array(
+            [layer_2q_counts.get(i, 0) for i in range(total_depth)], dtype=np.float64
+        )
+        layer_3q = np.array(
+            [layer_3q_counts.get(i, 0) for i in range(total_depth)], dtype=np.float64
+        )
+    else:
+        layer_counts = np.zeros(1, dtype=np.float64)
+        active_counts = np.zeros(1, dtype=np.float64)
+        layer_2q = np.zeros(1, dtype=np.float64)
+        layer_3q = np.zeros(1, dtype=np.float64)
+
+    avg_parallel = total_gates / max(total_depth, 1)
 
     return {
         "circuit_depth": float(total_depth),
         "depth_per_qubit": float(total_depth) / max(n, 1),
-        "gate_density": len(circuit.gates) / max(n * total_depth, 1),
+        "gate_density": total_gates / max(n * total_depth, 1),
+        "avg_parallel_gates": float(avg_parallel),
+        "max_parallel_gates": float(layer_counts.max()),
+        "std_parallel_gates": float(layer_counts.std()),
+        "parallel_gates_per_qubit": float(avg_parallel) / max(n, 1),
+        "max_parallel_gates_per_qubit": float(layer_counts.max()) / max(n, 1),
+        "avg_active_qubits": float(active_counts.mean()),
+        "max_active_qubits": float(active_counts.max()),
+        "std_active_qubits": float(active_counts.std()),
+        "active_qubit_ratio": float(active_counts.mean()) / max(n, 1),
+        "avg_2q_gates_per_layer": float(layer_2q.mean()),
+        "avg_3q_gates_per_layer": float(layer_3q.mean()),
+        "max_2q_gates_per_layer": float(layer_2q.max()),
+        "max_3q_gates_per_layer": float(layer_3q.max()),
     }
 
 
@@ -220,6 +299,8 @@ def compute_entanglement_layer_features(circuit: ParsedCircuit) -> Dict[str, flo
     n_entangling_gates = 0
     entangling_layers = 0
     prev_was_entangling = False
+    current_run = 0
+    run_lengths = []
 
     for gate in circuit.gates:
         is_ent = gate.name in TWO_QUBIT_GATES or gate.name in THREE_QUBIT_GATES
@@ -227,12 +308,40 @@ def compute_entanglement_layer_features(circuit: ParsedCircuit) -> Dict[str, flo
             n_entangling_gates += 1
             if not prev_was_entangling:
                 entangling_layers += 1
+                current_run = 1
+            else:
+                current_run += 1
             prev_was_entangling = True
         else:
             prev_was_entangling = False
+            if current_run > 0:
+                run_lengths.append(current_run)
+                current_run = 0
+
+    if current_run > 0:
+        run_lengths.append(current_run)
+
+    if entangling_layers > 0:
+        avg_per_layer = n_entangling_gates / entangling_layers
+    else:
+        avg_per_layer = 0.0
+
+    if run_lengths:
+        run_arr = np.array(run_lengths, dtype=np.float64)
+        max_run = float(run_arr.max())
+        mean_run = float(run_arr.mean())
+        std_run = float(run_arr.std())
+    else:
+        max_run = 0.0
+        mean_run = 0.0
+        std_run = 0.0
 
     return {
         "n_entangling_gates": float(n_entangling_gates),
         "n_entangling_layers": float(entangling_layers),
         "entangling_gate_ratio": n_entangling_gates / max(len(circuit.gates), 1),
+        "entangling_gates_per_layer": float(avg_per_layer),
+        "entangling_run_max": max_run,
+        "entangling_run_mean": mean_run,
+        "entangling_run_std": std_run,
     }
