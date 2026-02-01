@@ -4,7 +4,7 @@ Auxiliary Feature Predictors
 The training data contains derived sweep features that are only available
 during training (computed from running the actual simulation):
 - fidelity_at_1: Fidelity at threshold=1
-- rungs_to_099: Number of rungs to reach 0.99 fidelity
+- rungs_to_099: Number of rungs to reach TARGET_FIDELITY
 - biggest_fid_jump: Largest fidelity jump in the sweep
 - biggest_jump_rung: Rung where the biggest jump occurred
 - verify_p_return_zero: Verification probability

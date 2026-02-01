@@ -2,7 +2,7 @@
 Training data loader.
 
 Loads hackathon_public.json and extracts structured training labels:
-- selected_threshold (minimum threshold achieving >= 0.99 fidelity)
+- selected_threshold (minimum threshold achieving >= TARGET_FIDELITY)
 - forward_wall_s (10,000-shot forward run time)
 - timing decomposition (setup + per-shot)
 - threshold sweep curves (fidelity at each rung)
@@ -21,6 +21,7 @@ import pandas as pd
 
 THRESHOLD_RUNGS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 THRESHOLD_LOG2 = {t: int(math.log2(t)) for t in THRESHOLD_RUNGS}
+TARGET_FIDELITY = 0.75
 
 
 def load_training_data(json_path: str | Path) -> Dict[str, Any]:
@@ -63,7 +64,7 @@ def build_results_dataframe(data: Dict[str, Any]) -> pd.DataFrame:
             "precision": r["precision"],
         }
 
-        # Selection info
+        # Selection info (recomputed using TARGET_FIDELITY when sweep data is available)
         sel = r.get("selection", {})
         row["selected_threshold"] = sel.get("selected_threshold")
         row["selected_fidelity"] = sel.get("selected_mirror_metric_value")
@@ -124,8 +125,8 @@ def build_results_dataframe(data: Dict[str, Any]) -> pd.DataFrame:
             # Fidelity at threshold=1 (baseline difficulty)
             row["fidelity_at_1"] = fidelities[0][1] if fidelities[0][0] == 1 else None
 
-            # Convergence rate: how many rungs to reach 0.99
-            crossed = [rung for rung, f in fidelities if f >= 0.99]
+            # Convergence rate: how many rungs to reach TARGET_FIDELITY
+            crossed = [rung for rung, f in fidelities if f >= TARGET_FIDELITY]
             row["rungs_to_099"] = THRESHOLD_LOG2.get(crossed[0], 10) if crossed else 10
 
             # Biggest fidelity jump
@@ -148,6 +149,19 @@ def build_results_dataframe(data: Dict[str, Any]) -> pd.DataFrame:
             row["rungs_to_099"] = 10
             row["biggest_fid_jump"] = None
             row["biggest_jump_rung"] = None
+
+        # Override selection threshold based on TARGET_FIDELITY when sweep is available
+        if fidelities:
+            crossed = [rung for rung, f in fidelities if f >= TARGET_FIDELITY]
+            if crossed:
+                selected_thr = crossed[0]
+            else:
+                selected_thr = fidelities[-1][0]
+            row["selected_threshold"] = selected_thr
+            row["selected_threshold_log2"] = int(math.log2(selected_thr))
+            row["selected_fidelity"] = next(
+                (f for rung, f in fidelities if rung == selected_thr), None
+            )
 
         # Verify
         verify = r.get("verify", {})

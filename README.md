@@ -13,55 +13,30 @@ python src/evaluation/scripts/prep_cv_splits.py
 
 `src/evaluation/scripts/prep_cv_splits.py` is the script that writes `outputs/cv_splits.json`, which is shared by **all** model training/evaluation.
 
-### 2) Prepare per-model data (features only)
+### 2) Train models
 
-Each model has a `prep.py` that regenerates features and **expects** CV splits to already exist.
-
-```
-python src/models/lgbm/prep.py
-python src/models/naive_bucket/prep.py
-python src/models/lgbm_curve/prep.py
-```
-
-### 3) Train models
-
-**Main LGBM model**
+**Threshold models**
 
 ```
-python src/models/lgbm/train.py
+python src/threshold_models/lgbm/train.py
+python src/threshold_models/naive_bucket/train.py
 ```
 
-This trains per-fold and full models and saves them to:
-- `outputs/combined_model/fold_*.pkl`
-- `outputs/combined_model/full_model.pkl`
-
-**Naive bucket baseline**
+**Runtime models**
 
 ```
-python src/models/naive_bucket/train.py
+python src/runtime_models/lgbm/train.py
+python src/runtime_models/naive_bucket/train.py
 ```
 
-This trains per-fold and full models and saves them to:
-- `outputs/naive_bucket/fold_*.pkl`
-- `outputs/naive_bucket/full_model.pkl`
-
-**LGBM curve-fit fidelity model**
+### 3) Compare models
 
 ```
-python src/models/lgbm_curve/train.py
+python run_compare_threshold.py
+python run_compare_runtime.py
 ```
 
-This trains per-fold and full models and saves them to:
-- `outputs/lgbm_curve/fold_*.pkl`
-- `outputs/lgbm_curve/full_model.pkl`
-
-### 4) Compare models
-
-```
-python run_compare.py
-```
-
-This loads the pretrained models and evaluates them on the fixed CV splits in `outputs/cv_splits.json`.
+These load the pretrained models and evaluate them on the fixed CV splits in `outputs/cv_splits.json`.
 
 ## Script Map
 
@@ -69,26 +44,25 @@ This loads the pretrained models and evaluates them on the fixed CV splits in `o
   - `src/data/scripts/prep_features.py`
 - CV splits (shared across all models)
   - `src/evaluation/scripts/prep_cv_splits.py`
-- LGBM model
-  - `src/models/lgbm/prep.py`
-  - `src/models/lgbm/train.py`
-- Naive baseline
-  - `src/models/naive_bucket/prep.py`
-  - `src/models/naive_bucket/train.py`
-- LGBM curve-fit fidelity model
-  - `src/models/lgbm_curve/prep.py`
-  - `src/models/lgbm_curve/train.py`
+- Threshold models
+  - `src/threshold_models/lgbm/train.py`
+  - `src/threshold_models/naive_bucket/train.py`
+- Runtime models
+  - `src/runtime_models/lgbm/train.py`
+  - `src/runtime_models/naive_bucket/train.py`
 - Evaluation
-  - `run_compare.py`
+  - `run_compare_threshold.py`
+  - `run_compare_runtime.py`
 
 ## Outputs
 
 Key artifacts written to `outputs/`:
 - `training_features.pkl` / `training_features.csv`
 - `cv_splits.json` (shared CV splits)
-- `combined_model/` (LGBM fold + full models)
-- `naive_bucket/` (Naive fold + full models)
-- `lgbm_curve/` (curve-fit fold + full models)
+- `threshold_models/threshold_lgbm/` (LGBM fold + full models)
+- `threshold_models/threshold_naive/` (Naive fold + full models)
+- `runtime_models/runtime_lgbm/` (LGBM fold + full models)
+- `runtime_models/runtime_naive/` (Naive fold + full models)
 
 ## Notes
 
