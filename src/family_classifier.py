@@ -18,7 +18,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 
-from .qasm_parser import ParsedCircuit, TWO_QUBIT_GATES, THREE_QUBIT_GATES
+from .data.qasm_parser import ParsedCircuit, TWO_QUBIT_GATES, THREE_QUBIT_GATES
 
 
 # Rule-based family signatures derived from training circuit analysis.
