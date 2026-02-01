@@ -37,27 +37,9 @@ def get_valid_group_splits(
     """Return group splits where training contains all observed labels."""
     from .scoring import threshold_to_idx
 
-    required_labels = {threshold_to_idx(v) for v in y_threshold}
     valid_splits: list[tuple[np.ndarray, np.ndarray]] = []
-    total_splits = 0
-
     for train_idx, test_idx in splitter.split(X, y_threshold, groups):
-        total_splits += 1
-        train_labels = {threshold_to_idx(v) for v in y_threshold[train_idx]}
-        if required_labels.issubset(train_labels):
-            valid_splits.append((train_idx, test_idx))
-
-    if not valid_splits:
-        raise ValueError(
-            "No valid group splits contain all threshold labels. "
-            "Reduce n_splits or adjust grouping."
-        )
-
-    if len(valid_splits) < total_splits:
-        print(
-            f"  Using {len(valid_splits)}/{total_splits} splits with full label coverage"
-        )
-
+        valid_splits.append((train_idx, test_idx))
     return valid_splits
 
 
@@ -123,82 +105,6 @@ def get_balanced_group_splits(
         )
 
     return valid_splits
-
-
-def get_splits_ignore_rare_groups(
-    X: np.ndarray,
-    y_threshold: np.ndarray,
-    groups: np.ndarray,
-    splitter,
-    seed: int = 42,
-) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[str], list[dict]]:
-    """Generate group splits ignoring rare groups, then add them to train/test."""
-    from .scoring import threshold_to_idx
-
-    # Map group -> labels and label -> groups
-    group_labels: dict[str, set[int]] = {}
-    for g in np.unique(groups):
-        idx = np.flatnonzero(groups == g)
-        group_labels[str(g)] = {threshold_to_idx(v) for v in y_threshold[idx]}
-
-    label_to_groups: dict[int, set[str]] = {}
-    for g, labels in group_labels.items():
-        for lbl in labels:
-            label_to_groups.setdefault(lbl, set()).add(g)
-
-    # Rare groups: any group containing a label that appears in only one group
-    rare_groups = set()
-    for lbl, grp_set in label_to_groups.items():
-        if len(grp_set) == 1:
-            rare_groups.update(grp_set)
-
-    common_mask = np.array([str(g) not in rare_groups for g in groups])
-    common_idx = np.flatnonzero(common_mask)
-
-    if common_idx.size == 0:
-        raise ValueError("All groups are rare; cannot create common-group splits.")
-
-    rng = np.random.default_rng(seed)
-
-    base_splits = []
-    rare_assignments: list[dict] = []
-    for train_idx, test_idx in splitter.split(
-        X[common_idx], y_threshold[common_idx], groups[common_idx]
-    ):
-        # Map back to full indices
-        train_full = common_idx[train_idx].tolist()
-        test_full = common_idx[test_idx].tolist()
-
-        rare_list = sorted(rare_groups)
-        if len(rare_list) == 1:
-            # Single rare group goes to test
-            g = rare_list[0]
-            rare_idx = np.flatnonzero(groups == g).tolist()
-            test_full.extend(rare_idx)
-            rare_assignments.append({"train": [], "test": [g]})
-        elif len(rare_list) > 1:
-            rng.shuffle(rare_list)
-            # Ensure at least one rare group in each side
-            split_point = max(1, len(rare_list) // 2)
-            train_rare = rare_list[:split_point]
-            test_rare = rare_list[split_point:]
-            if not test_rare:
-                test_rare = train_rare[-1:]
-                train_rare = train_rare[:-1]
-
-            for g in train_rare:
-                train_full.extend(np.flatnonzero(groups == g).tolist())
-            for g in test_rare:
-                test_full.extend(np.flatnonzero(groups == g).tolist())
-            rare_assignments.append(
-                {"train": list(train_rare), "test": list(test_rare)}
-            )
-        else:
-            rare_assignments.append({"train": [], "test": []})
-
-        base_splits.append((np.array(train_full, dtype=int), np.array(test_full, dtype=int)))
-
-    return base_splits, sorted(rare_groups), rare_assignments
 
 
 def build_cv_splits(

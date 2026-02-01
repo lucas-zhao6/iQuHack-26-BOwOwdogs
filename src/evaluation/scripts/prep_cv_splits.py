@@ -18,7 +18,7 @@ from sklearn.model_selection import GroupKFold
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.evaluation.cv_splits import build_cv_splits, get_splits_ignore_rare_groups, save_cv_splits
+from src.evaluation.cv_splits import build_cv_splits, save_cv_splits
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
@@ -51,19 +51,11 @@ def main() -> None:
     splitter = GroupKFold(n_splits=n_splits)
     X_placeholder = np.zeros((len(df), 1), dtype=float)
 
-    base_splits, rare_groups, rare_assignments = get_splits_ignore_rare_groups(
-        X_placeholder,
-        y_threshold,
-        groups,
-        splitter,
-        seed=SEED,
-    )
-
     splits = build_cv_splits(
         X_placeholder,
         y_threshold,
         groups,
-        base_splits,
+        splitter,
         valid_size=VALID_SIZE,
         seed=SEED,
     )
@@ -74,17 +66,9 @@ def main() -> None:
         "actual_splits": len(splits),
         "valid_size": VALID_SIZE,
         "seed": SEED,
-        "coverage_rule": "ignore_rare_groups_then_assign",
+        "coverage_rule": "train_label_coverage",
     }
     save_cv_splits(CV_SPLITS_PATH, splits, n_samples=len(df), metadata=metadata)
-
-    if rare_groups:
-        print("\nRare groups (contain labels unique to a single circuit):")
-        for g in rare_groups:
-            print(f"  - {g}")
-        print("\nRare group assignments per split:")
-        for i, assign in enumerate(rare_assignments):
-            print(f"  Split {i}: train={assign['train']} | test={assign['test']}")
 
     print(f"Saved CV splits: {CV_SPLITS_PATH}")
     print(f"  Rows: {len(df)} | Circuits: {n_groups} | Splits: {n_splits}")
