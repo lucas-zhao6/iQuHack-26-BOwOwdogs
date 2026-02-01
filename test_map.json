@@ -1,0 +1,10 @@
+{
+  "schema": "iqhack_holdout_id_map_v1",
+  "entries": [
+    { "id": "H001", "qasm_file": "allcircuits/ghz_indep_qiskit_60.qasm" },
+    { "id": "H002", "qasm_file": "allcircuits/graphstate_indep_qiskit_30.qasm" },
+    { "id": "H003", "qasm_file": "allcircuits/qft_indep_qiskit_110.qasm" },
+    { "id": "H004", "qasm_file": "allcircuits/qftentangled_indep_qiskit_10.qasm" },
+    { "id": "H005", "qasm_file": "allcircuits/qnn_indep_qiskit_20.qasm" }
+  ]
+}
