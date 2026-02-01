@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import optuna
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit, LeaveOneGroupOut
+from sklearn.model_selection import LeaveOneGroupOut
 
 # Suppress sklearn warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -51,6 +51,7 @@ from src.scoring import (
     idx_to_threshold,
     find_optimal_safety_margin,
 )
+from src.cv_splits import build_cv_splits, load_cv_splits, split_train_valid_groups
 from src.feature_selection import FeatureSelector
 from src.auxiliary_features import AuxiliaryFeaturePredictor, extract_auxiliary_targets
 from src.naive_model import NaiveBucketModel
@@ -58,6 +59,7 @@ from src.naive_model import NaiveBucketModel
 # Paths
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
+CV_SPLITS_PATH = OUTPUT_DIR / "cv_splits.json"
 OPTUNA_TRIALS = 120
 OPTUNA_SPLITS = 5
 VALID_SIZE = 0.2
@@ -114,24 +116,6 @@ def prepare_features(df: pd.DataFrame):
     return X.values, y_threshold, y_total_time, y_setup_time, y_per_shot_time, feature_cols
 
 
-def split_train_valid_groups(
-    indices: np.ndarray,
-    groups: np.ndarray,
-    valid_size: float = 0.2,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Group-aware train/valid split for early stopping."""
-    unique_groups = np.unique(groups[indices])
-    if len(unique_groups) < 3 or valid_size <= 0:
-        return indices, np.array([], dtype=int)
-
-    splitter = GroupShuffleSplit(n_splits=1, test_size=valid_size, random_state=seed)
-    train_local, val_local = next(
-        splitter.split(np.zeros(len(indices)), groups=groups[indices])
-    )
-    return indices[train_local], indices[val_local]
-
-
 def enrich_with_auxiliary_features(
     X_train: np.ndarray,
     X_val: np.ndarray | None,
@@ -186,37 +170,6 @@ def append_runtime_extras(
     return np.hstack([X_rt] + processed)
 
 
-def get_valid_group_splits(
-    X: np.ndarray,
-    y_threshold: np.ndarray,
-    groups: np.ndarray,
-    splitter,
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Return group splits where training contains all observed labels."""
-    required_labels = {threshold_to_idx(v) for v in y_threshold}
-    valid_splits: list[tuple[np.ndarray, np.ndarray]] = []
-    total_splits = 0
-
-    for train_idx, test_idx in splitter.split(X, y_threshold, groups):
-        total_splits += 1
-        train_labels = {threshold_to_idx(v) for v in y_threshold[train_idx]}
-        if required_labels.issubset(train_labels):
-            valid_splits.append((train_idx, test_idx))
-
-    if not valid_splits:
-        raise ValueError(
-            "No valid group splits contain all threshold labels. "
-            "Reduce n_splits or adjust grouping."
-        )
-
-    if len(valid_splits) < total_splits:
-        print(
-            f"  Using {len(valid_splits)}/{total_splits} splits with full label coverage"
-        )
-
-    return valid_splits
-
-
 def leave_one_circuit_out_cv(
     df: pd.DataFrame,
     X: np.ndarray,
@@ -235,7 +188,7 @@ def leave_one_circuit_out_cv(
     use_auxiliary_features: bool = True,
     valid_size: float = 0.2,
     splitter=None,
-    splits: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    splits: list[dict] | list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict:
     """
     Perform leave-one-circuit-out cross-validation.
@@ -253,7 +206,9 @@ def leave_one_circuit_out_cv(
     if splits is None:
         if splitter is None:
             splitter = LeaveOneGroupOut()
-        splits = get_valid_group_splits(X, y_threshold, groups, splitter)
+        splits = build_cv_splits(
+            X, y_threshold, groups, splitter, valid_size=valid_size, seed=42
+        )
 
     all_pred_thresholds = []
     all_true_thresholds = []
@@ -264,10 +219,16 @@ def leave_one_circuit_out_cv(
 
     auxiliary_targets = extract_auxiliary_targets(df) if use_auxiliary_features else None
 
-    for fold, (train_idx, test_idx) in enumerate(splits):
-        train_idx, val_idx = split_train_valid_groups(
-            train_idx, groups, valid_size=valid_size, seed=42 + fold
-        )
+    for fold, split in enumerate(splits):
+        if isinstance(split, dict):
+            train_idx = split["train_idx"]
+            val_idx = split.get("val_idx", np.array([], dtype=int))
+            test_idx = split["test_idx"]
+        else:
+            train_idx, test_idx = split
+            train_idx, val_idx = split_train_valid_groups(
+                train_idx, groups, valid_size=valid_size, seed=42 + fold
+            )
         X_train, X_test = X[train_idx], X[test_idx]
         y_thr_train, y_thr_test = y_threshold[train_idx], y_threshold[test_idx]
         y_time_train, y_time_test = y_total_time[train_idx], y_total_time[test_idx]
@@ -405,7 +366,7 @@ def leave_one_circuit_out_cv(
 
 def evaluate_naive_baseline(
     df: pd.DataFrame,
-    splits: list[tuple[np.ndarray, np.ndarray]],
+    splits: list[dict] | list[tuple[np.ndarray, np.ndarray]],
 ) -> dict:
     """Evaluate naive bucketed baseline using the provided group splits."""
     all_pred_thresholds: list[int] = []
@@ -413,9 +374,13 @@ def evaluate_naive_baseline(
     all_pred_times: list[float] = []
     all_true_times: list[float] = []
 
-    for train_idx, test_idx in splits:
-        train_df = df.iloc[train_idx]
-        test_df = df.iloc[test_idx]
+    for split in splits:
+        if isinstance(split, dict):
+            train_df = df.iloc[split["train_idx"]]
+            test_df = df.iloc[split["test_idx"]]
+        else:
+            train_df = df.iloc[split[0]]
+            test_df = df.iloc[split[1]]
 
         model = NaiveBucketModel()
         model.fit(train_df, threshold_col="selected_threshold", runtime_col="forward_wall_s")
@@ -479,8 +444,8 @@ def tune_hyperparameters(
     y_setup_time: np.ndarray,
     y_per_shot_time: np.ndarray,
     feature_names: list,
+    splits: list[dict],
     n_trials: int = 120,
-    n_splits: int = 5,
     valid_size: float = 0.2,
 ) -> dict:
     """
@@ -488,11 +453,7 @@ def tune_hyperparameters(
 
     Returns best parameters for threshold and runtime models.
     """
-    n_groups = df["file"].nunique()
-    n_splits = min(n_splits, n_groups)
-    splitter = GroupKFold(n_splits=n_splits)
-    split_groups = df["file"].values
-    valid_splits = get_valid_group_splits(X, y_threshold, split_groups, splitter)
+    n_splits = len(splits)
 
     print("\n  Hyperparameter search (Optuna TPE, group-aware CV):")
     print(f"  Trials: {n_trials}, CV splits: {n_splits}, features: {len(feature_names)}")
@@ -517,7 +478,7 @@ def tune_hyperparameters(
             decision_policy=decision_policy,
             use_auxiliary_features=True,
             valid_size=valid_size,
-            splits=valid_splits,
+            splits=splits,
         )
         return result["scores"]["mean_threshold_score"]
 
@@ -636,11 +597,24 @@ def main():
     print("\n[3/5] Tuning hyperparameters with leave-one-circuit-out CV...")
     tune_start = time.time()
 
+    if not CV_SPLITS_PATH.exists():
+        raise FileNotFoundError(
+            f"CV splits not found: {CV_SPLITS_PATH}\n"
+            "Run 'python run_generate_cv_splits.py' first."
+        )
+
+    cv_splits, cv_meta = load_cv_splits(CV_SPLITS_PATH)
+    if cv_meta.get("n_samples") is not None and cv_meta["n_samples"] != len(df):
+        raise ValueError(
+            "CV splits do not match current dataset size. "
+            f"Splits have n_samples={cv_meta['n_samples']} but data has {len(df)} rows."
+        )
+
     best_params = tune_hyperparameters(
         df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
         feature_names=feature_cols,
+        splits=cv_splits,
         n_trials=OPTUNA_TRIALS,
-        n_splits=OPTUNA_SPLITS,
         valid_size=VALID_SIZE,
     )
 
@@ -650,9 +624,7 @@ def main():
     # ── Step 4: Final CV evaluation ────────────────────────────────────
     print("\n[4/5] Final cross-validation evaluation...")
 
-    n_groups = df["file"].nunique()
-    final_splitter = GroupKFold(n_splits=min(OPTUNA_SPLITS, n_groups))
-    final_splits = get_valid_group_splits(X, y_threshold, df["file"].values, final_splitter)
+    final_splits = cv_splits
 
     final_cv = leave_one_circuit_out_cv(
         df, X, y_threshold, y_total_time, y_setup_time, y_per_shot_time,
