@@ -17,7 +17,7 @@ from src.data.data_loader import load_holdout_tasks
 from src.data.feature_pipeline import extract_holdout_circuit_features
 from src.data.data_prep import build_feature_matrix
 from src.threshold_models.lgbm.predictor import ThresholdPredictor
-from src.runtime_models.lgbm.predictor_uncertainty import RuntimePredictorWithThresholdUncertainty
+from src.runtime_models.gpr.predictor import GPRRuntimePredictor
 
 
 def load_id_map(path: Path) -> Dict[str, str]:
@@ -99,9 +99,7 @@ def main() -> None:
     )
 
     threshold_path = artifacts_dir / "threshold_models" / "threshold_lgbm" / "full_model.pkl"
-    runtime_path = (
-        artifacts_dir / "runtime_models" / "runtime_lgbm_uncertainty" / "full_model.pkl"
-    )
+    runtime_path = artifacts_dir / "runtime_models" / "runtime_gpr" / "full_model.pkl"
 
     if not threshold_path.exists():
         raise FileNotFoundError(f"Threshold model not found: {threshold_path}")
@@ -109,8 +107,7 @@ def main() -> None:
         raise FileNotFoundError(f"Runtime model not found: {runtime_path}")
 
     threshold_predictor = ThresholdPredictor.load(threshold_path)
-    runtime_predictor = RuntimePredictorWithThresholdUncertainty.load(runtime_path)
-    runtime_predictor.threshold_predictor = threshold_predictor
+    runtime_predictor = GPRRuntimePredictor.load(runtime_path)
 
     X_thr, _ = build_feature_matrix(df, threshold_predictor.feature_columns)
     X_rt, _ = build_feature_matrix(df, runtime_predictor.feature_columns)

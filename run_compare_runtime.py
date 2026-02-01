@@ -31,6 +31,7 @@ CV_SPLITS_PATH = OUTPUT_DIR / "cv_splits.json"
 LGBM_DIR = OUTPUT_DIR / "runtime_models" / "runtime_lgbm"
 LGBM_UNC_DIR = OUTPUT_DIR / "runtime_models" / "runtime_lgbm_uncertainty"
 COMBINED_DIR = OUTPUT_DIR / "runtime_models" / "runtime_combined"
+GPR_DIR = OUTPUT_DIR / "runtime_models" / "runtime_gpr"
 NAIVE_DIR = OUTPUT_DIR / "runtime_models" / "runtime_naive"
 
 
@@ -120,10 +121,22 @@ def main() -> None:
         families = test_df["family"].tolist() if "family" in test_df.columns else None
         return model.predict(X_test, families=families)
 
+    def predict_gpr_runtime(fold: int, test_df: pd.DataFrame):
+        model_path = GPR_DIR / f"fold_{fold}.pkl"
+        if not model_path.exists():
+            raise FileNotFoundError(f"GPR runtime model not found: {model_path}")
+        from src.runtime_models.gpr.predictor import GPRRuntimePredictor
+        model = GPRRuntimePredictor.load(model_path)
+        X_test, _ = build_feature_matrix(test_df, model.feature_columns)
+        X_test = X_test.to_numpy()
+        thresholds = test_df["selected_threshold"].values.astype(float)
+        return model.predict(X_test, thresholds)
+
     results = [
         evaluate_model("runtime_lgbm", df, splits, predict_lgbm),
         evaluate_model("runtime_lgbm_unc", df, splits, predict_lgbm_uncertainty),
         evaluate_model("runtime_combined", df, splits, predict_combined_runtime),
+        evaluate_model("runtime_gpr", df, splits, predict_gpr_runtime),
         evaluate_model("runtime_naive", df, splits, predict_naive),
     ]
 
