@@ -15,7 +15,7 @@ except ImportError as exc:
         "LightGBM is required for training. Install with 'pip install lightgbm'."
     ) from exc
 
-from ..evaluation.scoring import (
+from ...evaluation.scoring import (
     THRESHOLD_RUNGS,
     idx_to_threshold,
     threshold_to_idx,

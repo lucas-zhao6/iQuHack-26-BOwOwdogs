@@ -8,7 +8,7 @@ from typing import Tuple
 import numpy as np
 import pickle
 
-from ..naive_model import NaiveBucketModel
+from ..naive_bucket.model import NaiveBucketModel
 
 
 class SavedNaiveBucketRunner:

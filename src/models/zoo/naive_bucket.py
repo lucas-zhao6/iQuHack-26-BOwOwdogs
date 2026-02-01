@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ..naive_model import NaiveBucketModel
+from ..naive_bucket.model import NaiveBucketModel
 
 
 class NaiveBucketRunner:

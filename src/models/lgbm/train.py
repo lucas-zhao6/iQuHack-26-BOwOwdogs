@@ -30,17 +30,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.combined import (
+from src.models.lgbm.combined import (
     CombinedPredictor,
     get_feature_columns,
 )
-from src.models.threshold_model import (
+from src.models.lgbm.threshold_model import (
     ThresholdModel,
     apply_family_floor,
     FAMILY_THRESHOLD_FLOORS,
     HIGH_THRESHOLD_FAMILIES,
 )
-from src.models.runtime_model import RuntimeModel
+from src.models.lgbm.runtime_model import RuntimeModel
 from src.evaluation.scoring import compute_threshold_metrics, compute_runtime_metrics, threshold_to_idx
 from src.evaluation.cv_splits import build_cv_splits, load_cv_splits, split_train_valid_groups
 from src.data.feature_selection import FeatureSelector
