@@ -25,7 +25,7 @@ warnings.filterwarnings(
 
 from src.threshold_models.features import get_feature_columns
 from src.evaluation.cv_splits import load_cv_splits
-from src.evaluation.scoring import THRESHOLD_RUNGS
+from src.evaluation.scoring import THRESHOLD_RUNGS, compute_threshold_metrics
 from src.threshold_models.lgbm.curve_threshold_model import (
     LGBMCurveThresholdModel,
     TARGET_FIDELITY,
@@ -85,7 +85,8 @@ def suggest_lgbm_params(
     max_leaves = min(2 ** max_depth, 63)
     num_leaves = trial.suggest_int(f"{prefix}num_leaves", max(8, 2 ** (max_depth - 1)), max_leaves)
     return {
-        "objective": "regression_l1",
+        "objective": "quantile",
+        "alpha": 1.0 / 6.0,
         "max_depth": max_depth,
         "num_leaves": num_leaves,
         "learning_rate": trial.suggest_float(f"{prefix}learning_rate", 0.01, 0.08, log=True),
@@ -103,30 +104,10 @@ def suggest_lgbm_params(
     }
 
 
-def compute_curve_log_mae(
-    preds: dict[int, np.ndarray],
-    y_curves: dict[int, np.ndarray],
-) -> float:
-    eps = 1e-6
-    errors = []
-    for rung, y_true in y_curves.items():
-        if rung not in preds:
-            continue
-        valid = np.isfinite(y_true)
-        if valid.sum() == 0:
-            continue
-        pred = preds[rung][valid]
-        true = y_true[valid]
-        err = np.mean(np.abs(np.log(np.clip(pred, eps, 1.0)) - np.log(np.clip(true, eps, 1.0))))
-        errors.append(err)
-    if not errors:
-        raise ValueError("No valid curve targets available for evaluation.")
-    return float(np.mean(errors))
-
-
 def tune_hyperparameters(
     X: np.ndarray,
     y_curves: dict[int, np.ndarray],
+    y_threshold: np.ndarray,
     splits: list[dict],
     n_trials: int = 120,
 ) -> dict:
@@ -136,7 +117,8 @@ def tune_hyperparameters(
 
     def objective(trial: optuna.Trial) -> float:
         lgb_params = suggest_lgbm_params(trial, "curve_")
-        fold_scores = []
+        all_pred: list[int] = []
+        all_true: list[int] = []
         for split in splits:
             train_idx = split["train_idx"]
             test_idx = split["test_idx"]
@@ -153,28 +135,29 @@ def tune_hyperparameters(
                 {r: np.asarray(y_curves[r][train_idx]) for r in y_curves},
                 eval_set=eval_set,
             )
-            preds = model.predict_fidelity(np.asarray(X[test_idx]), thresholds=THRESHOLD_RUNGS)
-            fold_scores.append(
-                compute_curve_log_mae(
-                    preds,
-                    {r: np.asarray(y_curves[r][test_idx]) for r in y_curves},
-                )
+            pred_thr = model.predict_threshold(
+                np.asarray(X[test_idx]),
+                target_fidelity=TARGET_FIDELITY,
+                thresholds=THRESHOLD_RUNGS,
             )
+            all_pred.extend([int(v) for v in pred_thr])
+            all_true.extend([int(v) for v in y_threshold[test_idx]])
 
-        return float(np.mean(fold_scores))
+        scores = compute_threshold_metrics(all_pred, all_true)
+        return scores["mean_threshold_score"]
 
     sampler = optuna.samplers.TPESampler(seed=42)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=max(5, n_splits))
-    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     study.optimize(objective, n_trials=n_trials)
 
     best_params = study.best_trial.params
     best_lgb_params = {k.replace("curve_", ""): v for k, v in best_params.items() if k.startswith("curve_")}
 
-    print(f"\n  Best curve configuration (log-mae={study.best_value:.5f})")
+    print(f"\n  Best curve configuration (thr_score={study.best_value:.5f})")
     return {
         "lgb_params": best_lgb_params,
-        "best_curve_log_mae": study.best_value,
+        "best_curve_threshold_score": study.best_value,
         "n_trials": len(study.trials),
     }
 
@@ -204,6 +187,7 @@ def main() -> None:
     best_params = tune_hyperparameters(
         X,
         y_curves,
+        df["selected_threshold"].values.astype(float),
         splits,
         n_trials=OPTUNA_TRIALS,
     )
