@@ -5,6 +5,7 @@ Threshold model and related helpers.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+import warnings
 
 import numpy as np
 
@@ -20,6 +21,12 @@ from ...evaluation.scoring import (
     idx_to_threshold,
     threshold_to_idx,
     compute_threshold_score,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
 )
 
 

@@ -28,6 +28,7 @@ FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
 CV_SPLITS_PATH = OUTPUT_DIR / "cv_splits.json"
 LGBM_DIR = OUTPUT_DIR / "threshold_models" / "threshold_lgbm"
 LGBM_CURVE_DIR = OUTPUT_DIR / "threshold_models" / "threshold_lgbm_curve"
+GPR_CURVE_DIR = OUTPUT_DIR / "threshold_models" / "threshold_gpr_curve"
 NAIVE_DIR = OUTPUT_DIR / "threshold_models" / "threshold_naive"
 
 
@@ -111,9 +112,24 @@ def main() -> None:
         X_test = X_test.to_numpy()
         return model.predict_threshold(X_test, target_fidelity=target_fidelity, thresholds=rungs)
 
+    def predict_gpr_curve(fold: int, test_df: pd.DataFrame):
+        model_path = GPR_CURVE_DIR / f"fold_{fold}.pkl"
+        if not model_path.exists():
+            raise FileNotFoundError(f"GPR curve threshold model not found: {model_path}")
+        with open(model_path, "rb") as f:
+            payload = pickle.load(f)
+        model = payload["model"]
+        feature_cols = payload["feature_cols"]
+        rungs = payload.get("rungs", [])
+        target_fidelity = payload.get("target_fidelity", 0.75)
+        X_test, _ = build_feature_matrix(test_df, feature_cols)
+        X_test = X_test.to_numpy()
+        return model.predict_threshold(X_test, target_fidelity=target_fidelity, thresholds=rungs)
+
     results = [
         evaluate_model("threshold_lgbm", df, splits, predict_lgbm),
         evaluate_model("threshold_lgbm_curve", df, splits, predict_lgbm_curve),
+        evaluate_model("threshold_gpr_curve", df, splits, predict_gpr_curve),
         evaluate_model("threshold_naive", df, splits, predict_naive),
     ]
 
