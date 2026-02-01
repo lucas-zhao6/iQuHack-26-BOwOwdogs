@@ -8,6 +8,7 @@ minimum threshold that achieves the target fidelity.
 from __future__ import annotations
 
 from typing import Dict, Iterable, Optional, Tuple
+import warnings
 
 import numpy as np
 
@@ -22,6 +23,12 @@ from src.evaluation.scoring import THRESHOLD_RUNGS
 
 
 TARGET_FIDELITY = 0.75
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+)
 
 
 class LGBMCurveThresholdModel:

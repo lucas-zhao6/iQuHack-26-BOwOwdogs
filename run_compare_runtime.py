@@ -22,6 +22,7 @@ from src.evaluation.cv_splits import load_cv_splits
 from src.data.data_prep import build_feature_matrix
 from src.runtime_models.lgbm.predictor import RuntimePredictor
 from src.runtime_models.lgbm.predictor_uncertainty import RuntimePredictorWithThresholdUncertainty
+from src.runtime_models.combined_runtime import CombinedRuntimePredictor
 from src.evaluation.scoring import compute_runtime_metrics
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -29,6 +30,7 @@ FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
 CV_SPLITS_PATH = OUTPUT_DIR / "cv_splits.json"
 LGBM_DIR = OUTPUT_DIR / "runtime_models" / "runtime_lgbm"
 LGBM_UNC_DIR = OUTPUT_DIR / "runtime_models" / "runtime_lgbm_uncertainty"
+COMBINED_DIR = OUTPUT_DIR / "runtime_models" / "runtime_combined"
 NAIVE_DIR = OUTPUT_DIR / "runtime_models" / "runtime_naive"
 
 
@@ -108,9 +110,20 @@ def main() -> None:
         thresholds = test_df["selected_threshold"].values.astype(float)
         return model.predict(X_test, thresholds)
 
+    def predict_combined_runtime(fold: int, test_df: pd.DataFrame):
+        model_path = COMBINED_DIR / f"fold_{fold}.pkl"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Combined runtime model not found: {model_path}")
+        model = CombinedRuntimePredictor.load(model_path)
+        X_test, _ = build_feature_matrix(test_df, model.feature_columns)
+        X_test = X_test.to_numpy()
+        families = test_df["family"].tolist() if "family" in test_df.columns else None
+        return model.predict(X_test, families=families)
+
     results = [
         evaluate_model("runtime_lgbm", df, splits, predict_lgbm),
         evaluate_model("runtime_lgbm_unc", df, splits, predict_lgbm_uncertainty),
+        evaluate_model("runtime_combined", df, splits, predict_combined_runtime),
         evaluate_model("runtime_naive", df, splits, predict_naive),
     ]
 

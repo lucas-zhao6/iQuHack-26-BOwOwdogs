@@ -5,6 +5,7 @@ Runtime model for forward run wall time.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+import warnings
 
 import numpy as np
 
@@ -23,6 +24,13 @@ except ImportError as exc:
     ) from exc
 
 from sklearn.linear_model import ElasticNet
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+)
 
 
 class RuntimeModel:
@@ -82,6 +90,7 @@ class RuntimeModel:
         self._calibration = None
         self._blend_weights = None
         self._ensemble_models = {}
+        self._elastic_scaler = None
 
     def _safe_expm1(self, x: np.ndarray, max_log: float = 12.0) -> np.ndarray:
         """Exponentiate safely from log1p space."""
@@ -156,8 +165,16 @@ class RuntimeModel:
         cat.fit(X_with_thr, y_log)
         self._ensemble_models["catboost"] = cat
 
-        enet = ElasticNet(alpha=0.002, l1_ratio=0.2, max_iter=5000, random_state=self.random_state)
-        enet.fit(X_with_thr, y_log)
+        self._elastic_scaler = StandardScaler()
+        X_scaled = self._elastic_scaler.fit_transform(X_with_thr)
+        enet = ElasticNet(
+            alpha=0.002,
+            l1_ratio=0.2,
+            max_iter=15000,
+            tol=1e-4,
+            random_state=self.random_state,
+        )
+        enet.fit(X_scaled, y_log)
         self._ensemble_models["elasticnet"] = enet
 
         if eval_data is not None:
@@ -166,7 +183,13 @@ class RuntimeModel:
             preds = {
                 "base": base_pred,
                 "catboost": self._safe_expm1(cat.predict(X_val)),
-                "elasticnet": self._safe_expm1(enet.predict(X_val)),
+                "elasticnet": self._safe_expm1(
+                    enet.predict(
+                        getattr(self, "_elastic_scaler", None).transform(X_val)
+                    )
+                    if getattr(self, "_elastic_scaler", None) is not None
+                    else enet.predict(X_val)
+                ),
             }
 
             best_score = -np.inf
@@ -309,7 +332,13 @@ class RuntimeModel:
                 pred = (
                     w_base * base_pred
                     + w_cat * self._safe_expm1(self._ensemble_models["catboost"].predict(X_val_with_thr))
-                    + w_enet * self._safe_expm1(self._ensemble_models["elasticnet"].predict(X_val_with_thr))
+                    + w_enet * self._safe_expm1(
+                        self._ensemble_models["elasticnet"].predict(
+                            getattr(self, "_elastic_scaler", None).transform(X_val_with_thr)
+                        )
+                        if getattr(self, "_elastic_scaler", None) is not None
+                        else self._ensemble_models["elasticnet"].predict(X_val_with_thr)
+                    )
                 )
             else:
                 pred = base_pred
@@ -348,7 +377,13 @@ class RuntimeModel:
             total = (
                 w_base * total
                 + w_cat * self._safe_expm1(self._ensemble_models["catboost"].predict(X_with_thr))
-                + w_enet * self._safe_expm1(self._ensemble_models["elasticnet"].predict(X_with_thr))
+                + w_enet * self._safe_expm1(
+                    self._ensemble_models["elasticnet"].predict(
+                        getattr(self, "_elastic_scaler", None).transform(X_with_thr)
+                    )
+                    if getattr(self, "_elastic_scaler", None) is not None
+                    else self._ensemble_models["elasticnet"].predict(X_with_thr)
+                )
             )
 
         total = self._apply_calibration(total)
