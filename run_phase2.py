@@ -32,18 +32,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models import (
-    ThresholdModel,
-    RuntimeModel,
     CombinedPredictor,
     get_feature_columns,
+)
+from src.threshold_model import (
+    ThresholdModel,
     apply_family_floor,
     FAMILY_THRESHOLD_FLOORS,
     HIGH_THRESHOLD_FAMILIES,
 )
+from src.runtime_model import RuntimeModel
 from src.scoring import (
-    compute_overall_score,
     compute_threshold_score,
-    compute_runtime_score,
+    compute_runtime_log_score,
+    compute_threshold_metrics,
+    compute_runtime_metrics,
     threshold_to_idx,
     idx_to_threshold,
     find_optimal_safety_margin,
@@ -385,11 +388,9 @@ def leave_one_circuit_out_cv(
             all_indices.append(test_idx[j])
             all_families.append(fam)
 
-    # Compute overall score
-    scores = compute_overall_score(
-        all_pred_thresholds, all_pred_times,
-        all_true_thresholds, all_true_times
-    )
+    scores = {}
+    scores.update(compute_threshold_metrics(all_pred_thresholds, all_true_thresholds))
+    scores.update(compute_runtime_metrics(all_pred_times, all_true_times))
 
     return {
         "scores": scores,
@@ -425,12 +426,9 @@ def evaluate_naive_baseline(
         all_pred_times.extend([float(v) for v in pred_time])
         all_true_times.extend([float(v) for v in test_df["forward_wall_s"].values])
 
-    scores = compute_overall_score(
-        all_pred_thresholds,
-        all_pred_times,
-        all_true_thresholds,
-        all_true_times,
-    )
+    scores = {}
+    scores.update(compute_threshold_metrics(all_pred_thresholds, all_true_thresholds))
+    scores.update(compute_runtime_metrics(all_pred_times, all_true_times))
 
     return {
         "scores": scores,
@@ -486,7 +484,7 @@ def tune_hyperparameters(
     valid_size: float = 0.2,
 ) -> dict:
     """
-    Bayesian hyperparameter search (Optuna) using competition score.
+    Bayesian hyperparameter search (Optuna) using threshold score.
 
     Returns best parameters for threshold and runtime models.
     """
@@ -521,7 +519,7 @@ def tune_hyperparameters(
             valid_size=valid_size,
             splits=valid_splits,
         )
-        return result["scores"]["overall_score"]
+        return result["scores"]["mean_threshold_score"]
 
     sampler = optuna.samplers.TPESampler(seed=42)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=max(5, n_splits))
@@ -532,7 +530,7 @@ def tune_hyperparameters(
     best_thr_params = {k.replace("thr_", ""): v for k, v in best_params.items() if k.startswith("thr_")}
     best_rt_params = {k.replace("rt_", ""): v for k, v in best_params.items() if k.startswith("rt_")}
 
-    print(f"\n  Best configuration (score={study.best_value:.4f}):")
+    print(f"\n  Best threshold configuration (score={study.best_value:.4f}):")
     print(f"    Safety margin: {best_params['safety_margin']}")
     print(f"    Use family floors: {best_params['use_family_floor']}")
     print(f"    Feature method: {best_params['feature_method']}")
@@ -548,7 +546,7 @@ def tune_hyperparameters(
         "decision_policy": best_params["decision_policy"],
         "n_features": best_params["n_features"],
         "use_auxiliary_features": True,
-        "best_score": study.best_value,
+        "best_threshold_score": study.best_value,
         "n_trials": len(study.trials),
     }
 
@@ -557,10 +555,11 @@ def analyze_cv_results(cv_result: dict, df: pd.DataFrame):
     """Print detailed analysis of CV results."""
     scores = cv_result["scores"]
 
-    print(f"\n  Overall competition score: {scores['overall_score']:.4f}")
-    print(f"  Mean threshold score: {scores['mean_threshold_score']:.4f}")
-    print(f"  Mean runtime score: {scores['mean_runtime_score']:.4f}")
+    print(f"\n  Mean threshold score: {scores['mean_threshold_score']:.4f}")
     print(f"  Threshold failures (score=0): {scores['n_threshold_failures']}/{scores['n_tasks']}")
+    print(f"  Mean runtime log score: {scores['mean_runtime_log_score']:.4f}")
+    if scores.get("n_runtime_invalid", 0) > 0:
+        print(f"  Runtime invalid: {scores['n_runtime_invalid']}/{scores['n_tasks']}")
 
     # Per-circuit analysis
     pred_thr = np.array(cv_result["pred_thresholds"])
@@ -569,25 +568,30 @@ def analyze_cv_results(cv_result: dict, df: pd.DataFrame):
     true_time = np.array(cv_result["true_times"])
     indices = cv_result["indices"]
 
-    # Find worst predictions
-    task_scores = []
-    for pt, tt, ptr, ttr in zip(pred_thr, true_thr, pred_time, true_time):
-        thr_score = compute_threshold_score(pt, tt)
-        rt_score = compute_runtime_score(ptr, ttr)
-        task_scores.append(thr_score * rt_score)
+    thr_scores = np.array([compute_threshold_score(pt, tt) for pt, tt in zip(pred_thr, true_thr)])
+    rt_scores = np.array([compute_runtime_log_score(ptr, ttr) for ptr, ttr in zip(pred_time, true_time)])
 
-    task_scores = np.array(task_scores)
-    worst_indices = np.argsort(task_scores)[:5]
-
-    print("\n  Worst 5 predictions:")
-    for idx in worst_indices:
+    worst_thr_idx = np.argsort(thr_scores)[:5]
+    print("\n  Worst 5 threshold predictions:")
+    for idx in worst_thr_idx:
         orig_idx = indices[idx]
         row = df.iloc[orig_idx]
         thr_score = compute_threshold_score(pred_thr[idx], true_thr[idx])
-        rt_score = compute_runtime_score(pred_time[idx], true_time[idx])
         print(f"    {row['file'][:30]:<30} {row['backend']:>3}/{row['precision']:<6} "
-              f"thr: {int(true_thr[idx]):>3} -> {int(pred_thr[idx]):>3} (score={thr_score:.2f}), "
-              f"time: {true_time[idx]:>7.1f} -> {pred_time[idx]:>7.1f} (score={rt_score:.2f})")
+              f"thr: {int(true_thr[idx]):>3} -> {int(pred_thr[idx]):>3} (score={thr_score:.2f})")
+
+    finite_rt = np.isfinite(rt_scores)
+    if finite_rt.any():
+        worst_rt_idx = np.argsort(rt_scores[finite_rt])[:5]
+        print("\n  Worst 5 runtime predictions (log score):")
+        finite_indices = np.flatnonzero(finite_rt)
+        for local_idx in worst_rt_idx:
+            idx = finite_indices[local_idx]
+            orig_idx = indices[idx]
+            row = df.iloc[orig_idx]
+            rt_score = compute_runtime_log_score(pred_time[idx], true_time[idx])
+            print(f"    {row['file'][:30]:<30} {row['backend']:>3}/{row['precision']:<6} "
+                  f"time: {true_time[idx]:>7.1f} -> {pred_time[idx]:>7.1f} (score={rt_score:.3f})")
 
     # Threshold confusion matrix
     print("\n  Threshold prediction summary:")
@@ -669,8 +673,9 @@ def main():
 
     print("\n  Naive bucketed baseline (same splits)...")
     naive_cv = evaluate_naive_baseline(df, final_splits)
-    print(f"  Naive CV Competition Score: {naive_cv['scores']['overall_score']:.4f}")
-    print(f"  Naive Threshold failures: {naive_cv['scores']['n_threshold_failures']}/{naive_cv['scores']['n_tasks']}")
+    print(f"  Naive mean threshold score: {naive_cv['scores']['mean_threshold_score']:.4f}")
+    print(f"  Naive threshold failures: {naive_cv['scores']['n_threshold_failures']}/{naive_cv['scores']['n_tasks']}")
+    print(f"  Naive mean runtime log score: {naive_cv['scores']['mean_runtime_log_score']:.4f}")
 
     # ── Step 5: Train final models ─────────────────────────────────────
     print("\n[5/5] Training final models on full data...")
@@ -811,7 +816,7 @@ def main():
         f.write(f"  enriched features: {len(enriched_feature_cols)}\n")
         f.write(f"\nEnhancements:\n")
         f.write(f"  use_auxiliary_features: {best_params.get('use_auxiliary_features', True)}\n")
-        f.write(f"\nCV Score: {best_params['best_score']:.4f}\n")
+        f.write(f"\nCV Threshold Score: {best_params['best_threshold_score']:.4f}\n")
     print(f"  Saved parameters to: {params_path}")
 
     # Save feature columns for prediction script (original + selected)
@@ -842,8 +847,9 @@ def main():
     print("\n" + "=" * 70)
     print("Phase 2 COMPLETE")
     print(f"  Training time: {total_time:.1f}s")
-    print(f"  CV Competition Score: {final_cv['scores']['overall_score']:.4f}")
-    print(f"  Threshold failures: {final_cv['scores']['n_threshold_failures']}/{final_cv['scores']['n_tasks']}")
+    print(f"  CV mean threshold score: {final_cv['scores']['mean_threshold_score']:.4f}")
+    print(f"  CV threshold failures: {final_cv['scores']['n_threshold_failures']}/{final_cv['scores']['n_tasks']}")
+    print(f"  CV mean runtime log score: {final_cv['scores']['mean_runtime_log_score']:.4f}")
     print(f"  Model saved to: {OUTPUT_DIR / 'combined_model.pkl'}")
     print("=" * 70)
 

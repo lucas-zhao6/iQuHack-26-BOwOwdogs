@@ -1,17 +1,19 @@
 """
-Competition scoring utilities.
+Scoring utilities.
 
-Implements the exact scoring formula from the challenge:
-- Threshold score: 2^(-steps_over) if pred >= true, else 0
-- Runtime score: min(r, 1/r) where r = pred/true
-- Task score: threshold_score * runtime_score
-- Overall score: mean(task_scores)
+Threshold score:
+- 0 if pred < true
+- 2^(-steps_over) if pred >= true
+
+Runtime score:
+- -abs(log(pred/true))
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Tuple, Dict
+from typing import Dict, List, Tuple
+
 import numpy as np
 
 
@@ -33,7 +35,7 @@ def idx_to_threshold(idx: int) -> int:
 
 def compute_threshold_score(pred_threshold: int, true_threshold: int) -> float:
     """
-    Compute threshold component of task score.
+    Compute threshold score.
 
     - If pred < true: return 0 (fidelity violated - catastrophic)
     - If pred >= true: return 2^(-steps_over)
@@ -48,81 +50,58 @@ def compute_threshold_score(pred_threshold: int, true_threshold: int) -> float:
     return 2.0 ** (-steps_over)
 
 
-def compute_runtime_score(pred_time: float, true_time: float) -> float:
-    """
-    Compute runtime component of task score.
-
-    runtime_score = min(r, 1/r) where r = pred/true
-    Symmetric penalty: 2x over or under both give 0.5
-    """
+def compute_runtime_log_score(pred_time: float, true_time: float) -> float:
+    """Compute runtime score as -abs(log(pred/true))."""
     if true_time <= 0 or pred_time <= 0:
-        return 0.0
-
-    r = pred_time / true_time
-    return min(r, 1.0 / r)
-
-
-def compute_task_score(
-    pred_threshold: int,
-    pred_time: float,
-    true_threshold: int,
-    true_time: float,
-) -> Tuple[float, float, float]:
-    """
-    Compute full task score.
-
-    Returns: (task_score, threshold_score, runtime_score)
-    """
-    thr_score = compute_threshold_score(pred_threshold, true_threshold)
-    rt_score = compute_runtime_score(pred_time, true_time)
-    task_score = thr_score * rt_score
-    return task_score, thr_score, rt_score
+        return float("nan")
+    if not np.isfinite(true_time) or not np.isfinite(pred_time):
+        return float("nan")
+    return -abs(float(np.log(pred_time / true_time)))
 
 
-def compute_overall_score(
+def compute_threshold_metrics(
     pred_thresholds: List[int],
-    pred_times: List[float],
     true_thresholds: List[int],
-    true_times: List[float],
 ) -> Dict[str, float]:
-    """
-    Compute overall competition score across all tasks.
-
-    Returns dict with:
-    - overall_score: mean of task scores
-    - mean_threshold_score: mean of threshold scores
-    - mean_runtime_score: mean of runtime scores
-    - n_threshold_failures: count of pred < true (score = 0)
-    """
-    n = len(pred_thresholds)
-    task_scores = []
-    thr_scores = []
-    rt_scores = []
+    scores = []
     n_failures = 0
-
-    for i in range(n):
-        ts, ths, rts = compute_task_score(
-            pred_thresholds[i], pred_times[i],
-            true_thresholds[i], true_times[i]
-        )
-        task_scores.append(ts)
-        thr_scores.append(ths)
-        rt_scores.append(rts)
-        if ths == 0:
+    for pred, true in zip(pred_thresholds, true_thresholds):
+        score = compute_threshold_score(pred, true)
+        scores.append(score)
+        if score == 0:
             n_failures += 1
 
     return {
-        "overall_score": np.mean(task_scores),
-        "mean_threshold_score": np.mean(thr_scores),
-        "mean_runtime_score": np.mean(rt_scores),
+        "mean_threshold_score": float(np.mean(scores)) if scores else 0.0,
         "n_threshold_failures": n_failures,
-        "n_tasks": n,
+        "n_tasks": len(pred_thresholds),
+    }
+
+
+def compute_runtime_metrics(
+    pred_times: List[float],
+    true_times: List[float],
+) -> Dict[str, float]:
+    scores = []
+    invalid = 0
+    for pred, true in zip(pred_times, true_times):
+        score = compute_runtime_log_score(pred, true)
+        if np.isnan(score):
+            invalid += 1
+            continue
+        scores.append(score)
+
+    mean_score = float(np.mean(scores)) if scores else float("nan")
+    return {
+        "mean_runtime_log_score": mean_score,
+        "n_runtime_invalid": invalid,
+        "n_tasks": len(pred_times),
     }
 
 
 def asymmetric_threshold_loss(y_true_idx: np.ndarray, y_pred_idx: np.ndarray) -> float:
     """
-    Asymmetric loss for threshold prediction that matches competition scoring.
+    Asymmetric loss for threshold prediction that matches threshold scoring.
 
     Under-prediction is catastrophic (loss = 1.0).
     Over-prediction has exponential decay (loss = 1 - 2^(-steps_over)).
@@ -135,7 +114,7 @@ def asymmetric_threshold_loss(y_true_idx: np.ndarray, y_pred_idx: np.ndarray) ->
         else:
             steps_over = pred_idx_rounded - true_idx
             losses.append(1.0 - 2.0 ** (-steps_over))
-    return np.mean(losses)
+    return float(np.mean(losses)) if losses else 0.0
 
 
 def find_optimal_safety_margin(

@@ -1,4 +1,4 @@
-# Top 54 threshold features selected by corr
+# Top 35 threshold features selected by corr
 pred_rungs_to_099
 pred_biggest_jump_rung
 pred_fidelity_at_1
@@ -34,22 +34,3 @@ n_active_cuts
 std_cut_pressure
 graph_max_edge_weight
 n_entangling_gates
-gate_cu1_frac
-n_2q_gates
-max_cut_pressure
-entangling_cutwidth_natural
-graph_std_wdegree
-total_gates
-gate_u_count
-graph_max_wdegree
-circuit_depth
-graph_mean_edge_weight
-mean_cut_pressure
-log_n_qubits
-depth_per_qubit
-cut_pressure_per_qubit
-gate_u2_count
-graph_mean_wdegree
-entangling_gates_per_qubit
-gate_cx_count
-gates_per_qubit
