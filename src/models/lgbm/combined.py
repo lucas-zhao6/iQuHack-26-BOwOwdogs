@@ -17,12 +17,15 @@ import numpy as np
 import sys
 from . import threshold_model as _threshold_model
 from . import runtime_model as _runtime_model
-from ..data import feature_selection as _feature_selection
-from ..data import auxiliary_features as _auxiliary_features
+from ...data import feature_selection as _feature_selection
+from ...data import auxiliary_features as _auxiliary_features
 sys.modules.setdefault("src.threshold_model", _threshold_model)
 sys.modules.setdefault("src.runtime_model", _runtime_model)
 sys.modules.setdefault("src.feature_selection", _feature_selection)
 sys.modules.setdefault("src.auxiliary_features", _auxiliary_features)
+sys.modules.setdefault("src.models.threshold_model", _threshold_model)
+sys.modules.setdefault("src.models.runtime_model", _runtime_model)
+sys.modules.setdefault("src.models.combined", sys.modules[__name__])
 
 from .threshold_model import ThresholdModel, apply_family_floor, HIGH_THRESHOLD_FAMILIES
 from .runtime_model import RuntimeModel

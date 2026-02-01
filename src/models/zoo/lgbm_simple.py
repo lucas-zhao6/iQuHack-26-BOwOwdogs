@@ -6,8 +6,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ..threshold_model import ThresholdModel, apply_family_floor
-from ..runtime_model import RuntimeModel
+from ..lgbm.threshold_model import ThresholdModel, apply_family_floor
+from ..lgbm.runtime_model import RuntimeModel
 from ...evaluation.scoring import threshold_to_idx
 from ..data_loader import THRESHOLD_RUNGS
 

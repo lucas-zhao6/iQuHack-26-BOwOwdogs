@@ -16,6 +16,10 @@ import warnings
 import numpy as np
 import pandas as pd
 
+import sys
+sys.modules.setdefault("src.naive_model", sys.modules[__name__])
+sys.modules.setdefault("src.models.naive_model", sys.modules[__name__])
+
 
 @dataclass
 class NaiveBucketConfig:

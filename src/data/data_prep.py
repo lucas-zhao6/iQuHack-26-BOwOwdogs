@@ -7,7 +7,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
-from ..models.combined import get_feature_columns
+from ..models.lgbm.combined import get_feature_columns
 
 
 def build_feature_matrix(

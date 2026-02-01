@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message="X has feature n
 warnings.filterwarnings("ignore", category=UserWarning, message=".*joblib will operate in serial mode.*")
 
 import pandas as pd
+import numpy as np
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,7 +21,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.cv_splits import load_cv_splits
 from src.data.data_prep import build_feature_matrix
-from src.models.combined import CombinedPredictor
+from src.models.lgbm.combined import CombinedPredictor
+from src.models.lgbm_curve import LGBMCurveFidelityModel, DEFAULT_RUNGS
 from src.evaluation.scoring import compute_threshold_metrics, compute_runtime_metrics
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -28,6 +30,7 @@ FEATURES_PATH = OUTPUT_DIR / "training_features.pkl"
 CV_SPLITS_PATH = OUTPUT_DIR / "cv_splits.json"
 COMBINED_DIR = OUTPUT_DIR / "combined_model"
 NAIVE_DIR = OUTPUT_DIR / "naive_bucket"
+CURVE_DIR = OUTPUT_DIR / "lgbm_curve"
 
 
 def load_data() -> pd.DataFrame:
@@ -102,9 +105,45 @@ def main() -> None:
             model = pickle.load(f)
         return model.predict(test_df)
 
+    def predict_curve(fold: int, test_df: pd.DataFrame):
+        model_path = CURVE_DIR / f"fold_{fold}.pkl"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Curve model not found: {model_path}")
+        with open(model_path, "rb") as f:
+            payload = pickle.load(f)
+        model: LGBMCurveFidelityModel = payload["model"]
+        feature_cols = payload["feature_cols"]
+        rungs = payload.get("rungs", DEFAULT_RUNGS)
+        X_test, _ = build_feature_matrix(test_df, feature_cols)
+        X_test = X_test.to_numpy()
+        preds = model.predict(X_test, thresholds=rungs)
+
+        # Convert curve predictions to threshold/runtime via score-optimal rule.
+        # Use the smallest rung with predicted fidelity >= 0.99.
+        thresholds = []
+        for i in range(len(test_df)):
+            thr = rungs[-1]
+            for rung in rungs:
+                if preds[rung][i] >= 0.99:
+                    thr = rung
+                    break
+            thresholds.append(thr)
+        thresholds = np.array(thresholds, dtype=int)
+
+        # Use naive runtime lookup for compatibility (same as naive bucket model)
+        # (Curve model predicts fidelity only.)
+        naive_model_path = NAIVE_DIR / f"fold_{fold}.pkl"
+        if not naive_model_path.exists():
+            raise FileNotFoundError(f"Naive model not found for curve runtime: {naive_model_path}")
+        with open(naive_model_path, "rb") as f:
+            naive = pickle.load(f)
+        _, runtime = naive.predict(test_df)
+        return thresholds, runtime
+
     results = [
         evaluate_model("combined_lgbm", df, splits, predict_combined),
         evaluate_model("naive_bucket", df, splits, predict_naive),
+        evaluate_model("lgbm_curve", df, splits, predict_curve),
     ]
 
     print("\nModel comparison (fixed CV splits):")

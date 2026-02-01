@@ -7,7 +7,7 @@ from typing import Tuple
 
 import numpy as np
 
-from ..combined import CombinedPredictor
+from ..lgbm.combined import CombinedPredictor
 from ...data.data_prep import build_feature_matrix
 
 

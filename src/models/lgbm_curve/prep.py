@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare data and CV splits for NaiveBucket model."""
+"""Prepare data and CV splits for LGBM curve-fit fidelity model."""
 
 from __future__ import annotations
 
