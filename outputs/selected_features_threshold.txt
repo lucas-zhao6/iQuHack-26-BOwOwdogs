@@ -1,4 +1,4 @@
-# Top 62 threshold features selected by corr
+# Top 54 threshold features selected by corr
 pred_rungs_to_099
 pred_biggest_jump_rung
 pred_fidelity_at_1
@@ -53,11 +53,3 @@ graph_mean_wdegree
 entangling_gates_per_qubit
 gate_cx_count
 gates_per_qubit
-graph_p75_wdegree
-gate_u2_frac
-graph_median_wdegree
-cut_pressure_entropy
-frac_parameterized
-gate_u1_count
-gate_cry_count
-gate_cry_frac

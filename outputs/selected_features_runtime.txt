@@ -1,4 +1,4 @@
-# Top 62 runtime features selected by corr
+# Top 54 runtime features selected by corr
 graph_max_degree
 graph_bandwidth_heuristic
 graph_bandwidth_min
@@ -53,11 +53,3 @@ n_parameterized_gates
 frac_3q
 n_entangling_layers
 pred_biggest_jump_rung
-param_min
-frac_parameterized
-frac_long_range
-total_gates
-n_2q_gates
-n_entangling_gates
-graph_avg_clustering
-gate_cz_frac

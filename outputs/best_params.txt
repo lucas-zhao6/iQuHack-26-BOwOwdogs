@@ -2,17 +2,17 @@ Best Hyperparameters
 ==================================================
 
 Threshold Model:
-  max_depth: 6
-  num_leaves: 35
-  learning_rate: 0.07031370699968074
-  min_child_samples: 37
-  min_gain_to_split: 0.09190498008969329
-  feature_fraction: 0.6108915630455074
-  bagging_fraction: 0.8932679180783915
-  bagging_freq: 3
-  lambda_l1: 1.1198804804654274
-  lambda_l2: 1.2604141526697443
-  max_bin: 116
+  max_depth: 3
+  num_leaves: 8
+  learning_rate: 0.021607158158280567
+  min_child_samples: 26
+  min_gain_to_split: 0.077528619071968
+  feature_fraction: 0.884304540084805
+  bagging_fraction: 0.6653175332204321
+  bagging_freq: 4
+  lambda_l1: 2.731895298048724
+  lambda_l2: 7.342164491963862
+  max_bin: 92
   extra_trees: False
   safety_margin: 0.0
   use_family_floor: True
@@ -20,21 +20,21 @@ Threshold Model:
   decision_policy: argmax
 
 Runtime Model:
-  max_depth: 5
-  num_leaves: 28
-  learning_rate: 0.03329269681657561
-  min_child_samples: 36
-  min_gain_to_split: 0.012976702345133909
-  feature_fraction: 0.6127147263710278
-  bagging_fraction: 0.6300907599424155
-  bagging_freq: 4
-  lambda_l1: 4.3206634966551
-  lambda_l2: 1.134529053318957
-  max_bin: 247
-  extra_trees: True
+  max_depth: 6
+  num_leaves: 42
+  learning_rate: 0.015077727570894631
+  min_child_samples: 31
+  min_gain_to_split: 0.06878607278063457
+  feature_fraction: 0.8216926879317938
+  bagging_fraction: 0.8568113265736411
+  bagging_freq: 1
+  lambda_l1: 0.5618374071553451
+  lambda_l2: 4.460322211305357
+  max_bin: 97
+  extra_trees: False
 
 Feature Selection:
-  n_features: 62
+  n_features: 54
   method: corr
   from original: 125
   enriched features: 129
@@ -42,4 +42,4 @@ Feature Selection:
 Enhancements:
   use_auxiliary_features: True
 
-CV Score: 0.5974
+CV Score: 0.5732

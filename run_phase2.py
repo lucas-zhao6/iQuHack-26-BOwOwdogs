@@ -50,6 +50,7 @@ from src.scoring import (
 )
 from src.feature_selection import FeatureSelector
 from src.auxiliary_features import AuxiliaryFeaturePredictor, extract_auxiliary_targets
+from src.naive_model import NaiveBucketModel
 
 # Paths
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -401,6 +402,45 @@ def leave_one_circuit_out_cv(
     }
 
 
+def evaluate_naive_baseline(
+    df: pd.DataFrame,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+) -> dict:
+    """Evaluate naive bucketed baseline using the provided group splits."""
+    all_pred_thresholds: list[int] = []
+    all_true_thresholds: list[int] = []
+    all_pred_times: list[float] = []
+    all_true_times: list[float] = []
+
+    for train_idx, test_idx in splits:
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
+
+        model = NaiveBucketModel()
+        model.fit(train_df, threshold_col="selected_threshold", runtime_col="forward_wall_s")
+        pred_thr, pred_time = model.predict(test_df)
+
+        all_pred_thresholds.extend([int(v) for v in pred_thr])
+        all_true_thresholds.extend([int(v) for v in test_df["selected_threshold"].values])
+        all_pred_times.extend([float(v) for v in pred_time])
+        all_true_times.extend([float(v) for v in test_df["forward_wall_s"].values])
+
+    scores = compute_overall_score(
+        all_pred_thresholds,
+        all_pred_times,
+        all_true_thresholds,
+        all_true_times,
+    )
+
+    return {
+        "scores": scores,
+        "pred_thresholds": all_pred_thresholds,
+        "true_thresholds": all_true_thresholds,
+        "pred_times": all_pred_times,
+        "true_times": all_true_times,
+    }
+
+
 def suggest_lgbm_params(
     trial: optuna.Trial,
     prefix: str,
@@ -626,6 +666,11 @@ def main():
     )
 
     analyze_cv_results(final_cv, df)
+
+    print("\n  Naive bucketed baseline (same splits)...")
+    naive_cv = evaluate_naive_baseline(df, final_splits)
+    print(f"  Naive CV Competition Score: {naive_cv['scores']['overall_score']:.4f}")
+    print(f"  Naive Threshold failures: {naive_cv['scores']['n_threshold_failures']}/{naive_cv['scores']['n_tasks']}")
 
     # ── Step 5: Train final models ─────────────────────────────────────
     print("\n[5/5] Training final models on full data...")
